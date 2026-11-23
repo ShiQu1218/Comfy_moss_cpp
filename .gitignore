@@ -1,0 +1,8 @@
+.upstream/
+runtime/
+__pycache__/
+*.pyc
+test_results/
+native/build/
+native/build-gpu/
+cache/

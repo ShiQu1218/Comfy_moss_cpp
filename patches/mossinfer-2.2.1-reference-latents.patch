@@ -1,0 +1,352 @@
+diff --git a/include/mossinfer/mossinfer.h b/include/mossinfer/mossinfer.h
+index 44e3e9e..8726ec1 100644
+--- a/include/mossinfer/mossinfer.h
++++ b/include/mossinfer/mossinfer.h
+@@ -1415,6 +1415,13 @@ typedef struct mi_run_params {
+   mi_resize_mode control_resize;
+   /* (0, 1], required with the step cache on (0 is refused then: no model-dependent default); ignored when off. */
+   double step_cache_threshold;
++  /* Reference latents of an edit adapter (moss-edit-lora; the edit layout of mi_gen_params.reference_images, without
++   * the resize and VAE encode): up to 4 host F32 tensors [128, h, w] of model-space latents, copied at
++   * mi_run_begin(), which computes their keys and values once. Every row attends to them. Needs a run on latent 0
++   * alone, without MI_RUN_CROPS or an SLG row; each call evaluates at most 2 rows at the run's full size. Present from
++   * the 224-byte layout (a local extension). */
++  const mi_tensor* reference_latents;
++  size_t reference_latents_count;
+ } mi_run_params;
+ 
+ /* An output struct: struct_size set by the caller. */
+diff --git a/src/api/c_api.cpp b/src/api/c_api.cpp
+index 05bcae4..e15eed8 100644
+--- a/src/api/c_api.cpp
++++ b/src/api/c_api.cpp
+@@ -429,7 +429,7 @@ MI_LAYOUT(mi_run_row, skip_layers, 8);
+ MI_LAYOUT(mi_run_row, skip_layers_count, 16);
+ MI_LAYOUT(mi_run_row, latent, 24);
+ MI_LAYOUT(mi_run_row, _reserved0, 28);
+-static_assert(sizeof(mi_run_params) == 208);
++static_assert(sizeof(mi_run_params) == 224);
+ MI_LAYOUT(mi_run_params, struct_size, 0);
+ MI_LAYOUT(mi_run_params, width, 8);
+ MI_LAYOUT(mi_run_params, height, 12);
+@@ -461,6 +461,8 @@ MI_LAYOUT(mi_run_params, cfg_truncation, 184);
+ MI_LAYOUT(mi_run_params, step_cache, 192);
+ MI_LAYOUT(mi_run_params, control_resize, 196);
+ MI_LAYOUT(mi_run_params, step_cache_threshold, 200);
++MI_LAYOUT(mi_run_params, reference_latents, 208);
++MI_LAYOUT(mi_run_params, reference_latents_count, 216);
+ static_assert(sizeof(mi_run_info) == 64);
+ MI_LAYOUT(mi_run_info, struct_size, 0);
+ MI_LAYOUT(mi_run_info, latent_channels, 8);
+@@ -526,7 +528,9 @@ static_assert(kGenParamsSizes[2] == 320 && kGenParamsSizes[3] == 376, "the 1.0.0
+ // The component structs (2.1): one size each so far.
+ constexpr std::size_t kSessionParamsSize = sizeof(mi_session_params);
+ constexpr std::size_t kTextParamsSize = sizeof(mi_text_params);
+-constexpr std::size_t kRunParamsSize = sizeof(mi_run_params);
++// mi_run_params: 208 (2.1), 224 (with reference_latents).
++constexpr std::size_t kRunParamsSizes[] = {offsetof(mi_run_params, reference_latents), sizeof(mi_run_params)};
++static_assert(kRunParamsSizes[0] == 208, "the 2.1 mi_run_params");
+ constexpr std::size_t kStepParamsSize = sizeof(mi_step_params);
+ 
+ thread_local std::string t_last_error;
+@@ -1650,7 +1654,7 @@ void mi_conditioning_free(mi_conditioning* c) { delete c; }
+ mi_status mi_run_params_init(mi_run_params* params, size_t struct_size) {
+   return guarded([&] {
+     require(params, "params");
+-    check_size(struct_size, sizeof(mi_run_params), "mi_run_params");
++    check_size(struct_size, kRunParamsSizes, "mi_run_params");
+     init_prefix(params, run_params_defaults(), struct_size);
+     return MI_OK;
+   });
+@@ -1661,7 +1665,7 @@ mi_status mi_run_begin(mi_engine* engine, const mi_run_params* params) {
+     require(engine, "engine");
+     require(params, "params");
+     const mi_run_params p =
+-        read_input<mi_run_params>(params, std::span(&kRunParamsSize, 1), run_params_defaults, "mi_run_params");
++        read_input<mi_run_params>(params, kRunParamsSizes, run_params_defaults, "mi_run_params");
+     const SessionRef session(engine->session);
+     session->begin_run(p);
+     return MI_OK;
+diff --git a/src/api/component_adapter.cpp b/src/api/component_adapter.cpp
+index 8d9e010..479501d 100644
+--- a/src/api/component_adapter.cpp
++++ b/src/api/component_adapter.cpp
+@@ -219,6 +219,25 @@ pipeline::RunSpec to_run_spec(const mi_run_params& p, const pipeline::SessionOpt
+   s.exact_sigma = (p.flags & MI_RUN_EXACT_SIGMA) != 0;
+   s.crops = (p.flags & MI_RUN_CROPS) != 0;
+ 
++  // Reference latents: host F32 [128, h, w] each, copied (Session::validate checks their count and sizes).
++  if (p.reference_latents_count > 0 && p.reference_latents == nullptr) {
++    throw std::invalid_argument("reference_latents: NULL array with a nonzero count.");
++  }
++  if (p.reference_latents_count > static_cast<std::size_t>(pipeline::kMaxReferenceImages)) {
++    throw std::invalid_argument("At most " + std::to_string(pipeline::kMaxReferenceImages) + " reference latents.");
++  }
++  for (std::size_t i = 0; i < p.reference_latents_count; ++i) {
++    const std::string name = "reference_latents[" + std::to_string(i) + "]";
++    const Tensor t = to_tensor(p.reference_latents[i], name.c_str());
++    if (t.data == nullptr || t.device != Device::kCPU || t.dtype != DType::kF32 || t.rank != 3 ||
++        t.dim(0) != MI_LATENT_CHANNELS) {
++      throw std::invalid_argument(name + ": expected host f32[128, h, w].");
++    }
++    const auto* data = static_cast<const float*>(t.data);
++    s.reference_latents.push_back(
++        {std::vector<float>(data, data + t.numel()), static_cast<int>(t.dim(1)), static_cast<int>(t.dim(2))});
++  }
++
+   // Rows: their conditionings are kept alive by the run.
+   if (p.rows_count > 0 && p.rows == nullptr) throw std::invalid_argument("rows: NULL array with a nonzero count.");
+   if (p.rows_count < 1 || p.rows_count > static_cast<std::size_t>(options.max_rows)) {
+diff --git a/src/pipeline/session.cpp b/src/pipeline/session.cpp
+index 6731195..c13c285 100644
+--- a/src/pipeline/session.cpp
++++ b/src/pipeline/session.cpp
+@@ -39,8 +39,16 @@ struct Shape {
+   std::int64_t host_tokens = 0;     // the text-encoder states the equivalent request holds on the host
+   int steps = 1;
+   bool crops = false;
++  std::int64_t ref_tokens = 0;  // reference latents (RunSpec::reference_latents): their tokens and count
++  int ref_images = 0;
+ };
+ 
++std::int64_t reference_tokens(const RunSpec& spec) {
++  std::int64_t tokens = 0;
++  for (const RunSpec::ReferenceLatent& ref : spec.reference_latents) tokens += std::int64_t{ref.height} * ref.width;
++  return tokens;
++}
++
+ int resident_blocks(const planner::DitPlan& d) {
+   return d.residency == planner::DitResidency::kStreamed ? d.resident_blocks : moss_dit::kLayers;
+ }
+@@ -105,6 +113,8 @@ Shape run_shape(const RunSpec& spec, const Guidance& g, int steps, bool latent0_
+   sh.latents = latent0_only ? 1 : latents_of(spec);
+   sh.steps = steps;
+   sh.crops = spec.crops;
++  sh.ref_tokens = reference_tokens(spec);
++  sh.ref_images = static_cast<int>(spec.reference_latents.size());
+   std::vector<const Conditioning*> seen;
+   for (const auto& [bit, k] : evaluated_rows(spec, g, latent0_only)) {
+     const Conditioning& c = *spec.rows[static_cast<std::size_t>(k)].conditioning;
+@@ -207,6 +217,7 @@ struct Session::Run {
+   enum class Control { kNone, kRun, kCall };
+   Control last_control = Control::kNone;  // the control source of the last full (non-crop) call
+   std::optional<accel::FirstBlockCache> cache;
++  moss_dit::RefKv ref_kv;  // the reference latents' keys and values (on the run's stack; empty without references)
+   runtime::StagingLayout layout;
+   runtime::StagingBlock block;
+   std::unique_ptr<runtime::DevicePointerCheck> check;
+@@ -292,6 +303,8 @@ struct Session::State {
+                     (step_cache ? accel::FirstBlockCache::workspace_bytes(lh, lw, static_cast<int>(sh.rows.size())) : 0);
+     ds.control_groups = ctl != nullptr ? ctl->groups() : 0;
+     ds.crops = sh.crops;
++    ds.ref_tokens = sh.ref_tokens;
++    ds.ref_images = sh.ref_images;
+     return denoise_stack_bytes(ds, d.block_path, d.config, d.route);
+   }
+ 
+@@ -310,6 +323,8 @@ struct Session::State {
+     pc.steps = sh.steps;
+     pc.rows_per_step = static_cast<int>(sh.rows.size());
+     pc.need_dit = true;
++    pc.reference_tokens = sh.ref_tokens;
++    pc.reference_prefills = sh.ref_tokens > 0 ? 1 : 0;
+     pc.encoder = encoder;
+     pc.decode_height = H;
+     pc.decode_width = W;
+@@ -349,6 +364,7 @@ struct Session::State {
+     m.dit->set_cancel(nullptr);
+     m.dit->set_request_route(std::nullopt);
+     m.dit->set_input_extension(nullptr);
++    m.dit->set_references(nullptr);
+     m.dit->set_step_cache(nullptr);
+     m.dit->set_graphs_paused(false);
+     m.dit->set_graph_window(1);
+@@ -412,6 +428,41 @@ bool Session::close() {
+                             });
+ }
+ 
++namespace {
++
++// RunSpec::reference_latents: their count, shapes, values and the run layouts the DiT's reference path takes.
++void validate_references(const RunSpec& spec, int latents) {
++  const auto& refs = spec.reference_latents;
++  if (refs.empty()) return;
++  if (refs.size() > static_cast<std::size_t>(kMaxReferenceImages)) {
++    throw std::invalid_argument("At most " + std::to_string(kMaxReferenceImages) + " reference latents.");
++  }
++  for (std::size_t i = 0; i < refs.size(); ++i) {
++    const RunSpec::ReferenceLatent& ref = refs[i];
++    const std::string what = "reference_latents[" + std::to_string(i) + "]";
++    if (ref.height < 1 || ref.width < 1 ||
++        ref.data.size() != static_cast<std::size_t>(moss_dit::kLatentChannels) * ref.height * ref.width) {
++      throw std::invalid_argument(what + ": expected f32[" + std::to_string(moss_dit::kLatentChannels) + ", h, w].");
++    }
++    if (!std::all_of(ref.data.begin(), ref.data.end(), [](float v) { return std::isfinite(v); })) {
++      throw std::invalid_argument(what + ": the latents must be finite.");
++    }
++  }
++  const std::int64_t tokens = reference_tokens(spec);
++  if (tokens > moss_dit::kMaxReferenceTokens) {
++    throw std::invalid_argument("The reference latents take " + std::to_string(tokens) + " tokens; at most " +
++                                std::to_string(moss_dit::kMaxReferenceTokens) + ".");
++  }
++  if (latents != 1 || spec.crops) {
++    throw std::invalid_argument("Reference latents need a run on latent 0 alone, without MI_RUN_CROPS.");
++  }
++  if (spec.guidance == GuidanceMode::kMoss && spec.slg_scale > 0 && !spec.slg_layers.empty()) {
++    throw std::invalid_argument("Reference latents do not work with an SLG row (slg_scale > 0).");
++  }
++}
++
++}  // namespace
++
+ void Session::validate(const RunSpec& spec, const SessionOptions& options) {
+   const bool moss = spec.guidance == GuidanceMode::kMoss;
+   const auto n = static_cast<int>(spec.rows.size());
+@@ -464,6 +515,7 @@ void Session::validate(const RunSpec& spec, const SessionOptions& options) {
+   if (spec.step_cache != accel::StepCacheKind::kOff && !(spec.step_cache_threshold > 0 && spec.step_cache_threshold <= 1)) {
+     throw std::invalid_argument("The step cache needs an explicit threshold in (0, 1] (step_cache_threshold).");
+   }
++  validate_references(spec, latents);
+   // The rules mi_generate's request shares (sizes, steps, schedule fields, CFG, SLG, control images, accelerators).
+   const Guidance g = run_guidance(spec);
+   const Request run_q = run_request(options, spec, g);
+@@ -709,6 +761,27 @@ void Session::begin_run(const RunSpec& spec) {
+   }
+   m.refine_texts(texts, refined, r.timings);
+   if (s.cancelled()) throw SessionCancelled("the run was cancelled");
++  if (sh.ref_tokens > 0) {
++    // Reference latents: the run's key / value cache from one prefill (Pipeline::run's per pass), read by every call.
++    R.ref_kv.kv = arena.alloc_tensor(DType::kBF16, {moss_dit::kLayers, sh.ref_tokens, 2 * moss_dit::kDim});
++    const auto tp = Clock::now();
++    {
++      runtime::StackScope upload(arena);
++      std::vector<Tensor> lat;
++      for (const RunSpec::ReferenceLatent& ref : spec.reference_latents) {
++        lat.push_back(arena.alloc_tensor(DType::kF32, {moss_dit::kLatentChannels, ref.height, ref.width}));
++        MI_CUDA_CHECK(cudaMemcpyAsync(lat.back().data, ref.data.data(), lat.back().nbytes(), cudaMemcpyHostToDevice, stream));
++      }
++      try {
++        m.dit->prefill_references(lat, R.ref_kv, stream);
++      } catch (const moss_dit::Cancelled&) {
++        throw SessionCancelled("the reference prefill was cancelled");
++      }
++      MI_CUDA_CHECK(cudaStreamSynchronize(stream));
++    }
++    r.timings.reference_prefill_s += since(tp);
++    m.dit->set_references(&R.ref_kv);
++  }
+   for (const auto& [bit, k] : evaluated_rows(spec, g, false)) {
+     const RunRow& row = spec.rows[static_cast<std::size_t>(k)];
+     moss_dit::Row& dr = R.rows[static_cast<std::size_t>(bit)];
+@@ -889,6 +962,9 @@ StepReport Session::step(const StepArgs& a) {
+   const std::int64_t hc = x.dim(-2), wc = x.dim(-1);
+   const bool crop = hc != R.h || wc != R.w;
+   if (crop && R.moss) throw std::invalid_argument("Crop calls (x smaller than the run's size) need HOST guidance.");
++  if (R.ref_kv.tokens() > 0 && (crop || std::popcount(rows) > 2)) {
++    throw std::invalid_argument("A run with reference latents takes calls of at most 2 rows at the run's full size.");
++  }
+   const StagingViews views = staging_views(R);
+   const auto same_memory = [&](const Tensor& t, const std::string& what) {
+     if ((t.device == Device::kCUDA) != device) throw std::invalid_argument(what + ": tensors must all be device or all host memory.");
+diff --git a/src/pipeline/session.h b/src/pipeline/session.h
+index a75d9ec..0edae9d 100644
+--- a/src/pipeline/session.h
++++ b/src/pipeline/session.h
+@@ -133,6 +133,15 @@ struct RunSpec {
+   ResizeMode control_resize = ResizeMode::kCrop;
+   accel::StepCacheKind step_cache = accel::StepCacheKind::kOff;
+   double step_cache_threshold = 0;  // (0, 1], required with the step cache on
++  // Reference latents of an edit adapter (the edit layout, "index_timestep_zero_text_start"): model-space fp32
++  // [kLatentChannels, height, width] each (the latent grid), at most kMaxReferenceImages and kMaxReferenceTokens in all.
++  // begin_run computes their keys and values once; every row of every call then attends to them. Latent 0 only, at
++  // most 2 rows per call, no crop calls.
++  struct ReferenceLatent {
++    std::vector<float> data;
++    int height = 0, width = 0;
++  };
++  std::vector<ReferenceLatent> reference_latents;
+ };
+ 
+ struct RunInfo {
+diff --git a/tools/server/main.cpp b/tools/server/main.cpp
+index 142e854..ff8278d 100644
+--- a/tools/server/main.cpp
++++ b/tools/server/main.cpp
+@@ -722,7 +722,7 @@ class Server {
+            ",\"release\":" + tf(caps & MI_CAP_RELEASE) + ",\"certificate_dirs\":" + tf(caps & MI_CAP_CERTIFICATE_DIRS) +
+            ",\"te_host_pin\":" + tf(caps & MI_CAP_TE_HOST_PIN) + ",\"progress_fraction\":" +
+            tf(caps & MI_CAP_PROGRESS_FRACTION) + ",\"inspect\":" + tf(caps & MI_CAP_INSPECT) +
+-           ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) + ",\"check\":" + tf(caps & MI_CAP_CHECK) +
++           ",\"references\":" + tf(caps & MI_CAP_REFERENCE_IMAGES) + ",\"run_reference_latents\":true" + ",\"check\":" + tf(caps & MI_CAP_CHECK) +
+            ",\"components\":" + tf(caps & MI_CAP_COMPONENTS) +
+            "},\"values\":{" + values + "},\"probe\":{\"driver_cuda_version\":" +
+            std::to_string(probe.driver_cuda_version) + ",\"runtime_cuda_version\":" + std::to_string(probe.runtime_cuda_version) +
+@@ -1938,6 +1938,8 @@ class Server {
+     std::vector<mi_lora> loras;
+     std::vector<Params::ControlImage> control;
+     std::vector<mi_control_image> control_images;  // points into control
++    std::vector<std::shared_ptr<mi::server::shm::Region>> reference_regions;  // kept until mi_run_begin copied them
++    std::vector<mi_tensor> reference_latents;                                 // points into reference_regions
+   };
+ 
+   // run_begin {"width", "height", "rows": [{"conditioning", "skip_layers"?, "latent"?}], "guidance"?, "output"?,
+@@ -1949,7 +1951,7 @@ class Server {
+     p.only({"width", "height", "rows", "guidance", "output", "exact_sigma", "crops", "sigmas", "scheduler", "steps",
+             "shift", "flow_multiplier", "denoise_strength", "cfg", "slg_layers", "slg_scale", "slg_start", "slg_stop",
+             "loras", "control_lora_strength", "control_images", "control_resize", "cfg_truncation", "step_cache",
+-            "step_cache_threshold"});
++            "step_cache_threshold", "reference_latents"});
+     auto rq = std::make_shared<RunRequest>();
+     mi_run_params& r = rq->params;
+     if (const mi_status s = mi_run_params_init(&r, sizeof r); s != MI_OK) throw_status(s);
+@@ -2018,10 +2020,38 @@ class Server {
+       if (!(*v > 0 && *v <= 1)) throw RequestError("invalid_params", "\"step_cache_threshold\" must be a number in (0, 1]");
+       r.step_cache_threshold = *v;
+     }
++    if (const Value* v = p.find("reference_latents")) reference_latents(*v, *rq);
+     Session& s = session();
+     return enqueue(id, SessionTask::Kind::kCall, [this, &s, rq] { return begin_run(s, *rq); });
+   }
+ 
++  // run_begin's "reference_latents": [{"shm", "shape": [128, h, w]}] (1 to 4), F32 model-space latents in scratch
++  // regions' payloads (mi_run_params.reference_latents).
++  void reference_latents(const Value& v, RunRequest& rq) {
++    constexpr std::int64_t kMaxSide = 1024;  // latent cells: 16384 pixels
++    const std::string usage = "\"reference_latents\" must be an array of 1 to 4 {\"shm\", \"shape\": [128, h, w]}";
++    if (!v.is_array() || v.as_array().empty() || v.as_array().size() > 4) throw RequestError("invalid_params", usage);
++    for (const Value& e : v.as_array()) {
++      if (!e.is_object()) throw RequestError("invalid_params", usage);
++      const Params ref(&e);
++      ref.only({"shm", "shape"});
++      const Value* shape = ref.find("shape");
++      const auto in_range = [](const Value& d, std::int64_t lo, std::int64_t hi) {
++        return d.is_int() && d.as_int() >= lo && d.as_int() <= hi;
++      };
++      if (shape == nullptr || !shape->is_array() || shape->as_array().size() != 3 ||
++          !in_range(shape->as_array()[0], MI_LATENT_CHANNELS, MI_LATENT_CHANNELS) ||
++          !in_range(shape->as_array()[1], 1, kMaxSide) || !in_range(shape->as_array()[2], 1, kMaxSide)) {
++        throw RequestError("invalid_params", usage);
++      }
++      const std::int64_t h = shape->as_array()[1].as_int(), w = shape->as_array()[2].as_int();
++      std::shared_ptr<mi::server::shm::Region> region =
++          named_scratch(ref, "shm", std::uint64_t{4} * MI_LATENT_CHANNELS * static_cast<std::uint64_t>(h * w));
++      rq.reference_latents.push_back(host_tensor(region->payload(), MI_DTYPE_F32, {MI_LATENT_CHANNELS, h, w}));
++      rq.reference_regions.push_back(std::move(region));
++    }
++  }
++
+   // The worker's part of run_begin.
+   std::string begin_run(Session& s, RunRequest& rq) {
+     namespace shm = mi::server::shm;
+@@ -2058,6 +2088,10 @@ class Server {
+       r.control_images = rq.control_images.data();
+       r.control_images_count = rq.control_images.size();
+     }
++    if (!rq.reference_latents.empty()) {
++      r.reference_latents = rq.reference_latents.data();
++      r.reference_latents_count = rq.reference_latents.size();
++    }
+     if (const mi_status st = mi_run_begin(s.engine, &r); st != MI_OK) throw_call(st);
+     // From here an error ends the run again: a failed run_begin leaves none open.
+     RunState R;
