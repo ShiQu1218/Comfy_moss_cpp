@@ -2,6 +2,17 @@
 
 將 [mossimage.cpp / MossInfer](https://github.com/mossimage-cpp/mossimage.cpp) 接到 ComfyUI 的獨立採樣節點。使用 ComfyUI V3 API，沿用既有原生節點與標準 `MODEL`、`CONDITIONING`、`LATENT` 連線。
 
+## 速度
+
+![MOSS C++ 採樣速度比較](docs/speed.png)
+
+每張圖的採樣時間，從採樣節點開始計到 VAE Decode 開始；keep_engine 的數據取第 2 張起。
+
+- **橘色：** 改用 `dpmpp_2m` + `beta`，可把步數降到 20 步；10～12 步時文字與版面仍正確，照片細節略降。出圖會和預設的 ER-SDE 不同。見 [採樣數學研究](MATH_ACCELERATION_RESEARCH.md)。
+- **藍色：** 開啟進階選項 `keep_engine`，連續生圖時省去每張重新載入 DiT 的時間，像素與 20 步逐位元相同。設定方式見下方「參考圖」一節之後的 `keep_engine` 說明，數據見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
+
+重新產生圖表：`python docs/speed_chart.py`。
+
 ## 接入現有 workflow
 
 新增 **KSampler (MOSS Image C++)**，替換原本的 KSampler，接回同樣的四組輸入與 latent 輸出：
@@ -88,13 +99,23 @@ cmake --build build/windows-msvc-cuda13 --target moss-server mossinfer
 
 VRAM 足夠時，可將獨立採樣器的 `memory_mode` 設為 `balanced`，讓引擎優先將 DiT 權重留在 GPU。另可開啟進階選項 `cuda_graphs`，在全部 DiT 權重常駐且推論形狀重複時啟用 CUDA Graph。若引擎選擇串流權重，則沿用一般 fused 路徑。`cuda_graphs` 預設關閉。逐位元比對與本機量測方式見 [硬體加速報告](HARDWARE_BITWISE_RESEARCH.md)。
 
+進階選項 `keep_engine` 可在連續生圖時保留 C++ 引擎程序，省去每張圖重新載入 DiT 的時間，輸出像素與關閉時逐位元相同。設定如下：
+
+| 設定 | 兩張圖之間 | 本機 20 步採樣（第 2 張起） |
+| --- | --- | ---: |
+| `off`（預設） | 每張結束即關閉程序 | 10.4 s |
+| `release_vram` | 程序保留，DiT 釋放 VRAM，下張重新載入約 0.4 s；仍佔約 0.2 GB | 7.8 s |
+| `keep_vram` | DiT 留在 VRAM：`min_memory` 約 1.6 GB、`balanced` 約 7.1 GB | 7.7 s／6.4 s（balanced） |
+
+`release_vram` 在 RAM 足夠時會把 DiT 副本留在主機 RAM（本機 `balanced` 約 5.4 GB；`min_memory` 因 RAM 不足而未保留）。`keep_vram` 佔用的 VRAM 不受 ComfyUI 管理，同一個 ComfyUI 再載入其他大型模型時可能 OOM。更換 DiT（含同路徑替換檔案）、tier、memory_mode 或 cuda_graphs，或採樣失敗、取消時，會關閉舊程序並重新啟動。使用 LoKr 磁碟快取的那張圖不保留程序：快取固定覆寫同一個檔案，保留會用到舊權重並鎖住重建。數據與驗證見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
+
 ### LoKr 載入快取
 
 獨立採樣器預設開啟進階選項 `cache_lokr`。第一次把 LoKr 合併至一份獨立的 DiT 檔；後續相同模型、LoKr 組合及強度直接載入這份檔案，跳過每張圖重做的合併與 INT8 重新量化。更換提示詞、seed、尺寸、步數或 SLG 不需重建。沿用原生或 rgthree Power LoRA Loader 的接法即可，原始模型不會被修改。
 
 快取只保留最近一組，位於本節點的 `cache/lokr/`，占用一份 DiT 的磁碟空間；建立新組合時暫時再需要一份。修改 LoKr 內容／強度、來源模型路徑／大小／修改時間或 helper 版本會重建。不在 RAM／VRAM 常駐合併模型；重啟 ComfyUI 仍可重用磁碟快取。Ampere 及更新的 GPU 會照常即時套用普通 LoRA，包含區塊 side branch，以及與 LoKr 作用於不同權重的文字嵌入、時間調節與輸出層。舊 GPU 上混用一般 LoRA 與 LoKr、其他非線性 adapter 混用、特殊 patch、turbo 或不相容權重會沿用原本載入方式。快取失敗時會警告並退回原流程。
 
-這份磁碟快取不會在採樣結束時刪除；關閉 `cache_lokr` 也只停止使用快取。需要釋放磁碟空間時，先停止所有正在使用此節點的工作，再刪除 `cache/lokr/`。下次啟用時會重新合併。C++ 引擎程序及其 RAM／VRAM 則照常於每次採樣結束後回收。
+這份磁碟快取不會在採樣結束時刪除；關閉 `cache_lokr` 也只停止使用快取。需要釋放磁碟空間時，先停止所有正在使用此節點的工作，再刪除 `cache/lokr/`。下次啟用時會重新合併。C++ 引擎程序及其 RAM／VRAM 預設於每次採樣結束後回收（`keep_engine` 開啟時除外）。
 
 需要本機 helper `runtime/moss-lokr-cache.exe`（Linux 不含 `.exe`），此工作區已編譯安裝。它直接編譯固定版本上游的 CPU LoKr 合併與重新量化函式，原樣複製模型標頭與未修改的張量。重建方式見 [native/README.md](native/README.md)；未安裝 helper 時會提示並使用原流程。
 
@@ -147,7 +168,7 @@ python scripts/benchmark.py --url http://127.0.0.1:8189 --runs 2
 - 舊整合節點支援文字生圖。獨立採樣器的 LoRA 與 latent 輸入限制見上文。
 - `high` 搭配 INT8 DiT；`reference` 需要 bf16 DiT；`turbo` 需要上游支援的 INT4 / NVFP4 DiT。品質模式不會自動轉換權重。
 - 預設 `min_memory`。執行前會卸載同一個 ComfyUI 程序內快取的模型，讓出 VRAM。其他程序占用的 VRAM 需自行釋放。
-- 每張圖啟動一次引擎，完成或取消後回收程序與暫存檔，連續生圖會重複載入模型。取消會終止專屬的子程序。
+- 預設每張圖啟動一次引擎，完成或取消後回收程序與暫存檔；連續生圖可用 `keep_engine` 保留程序。取消會終止專屬的子程序。
 - 此節點呼叫 CUDA 版 `moss-infer`；所需 GPU 與驅動以該套件為準。未驗證 Vulkan / HIP 引擎。
 - 節點執行時不會下載模型或執行 shell；執行檔只能由本機安裝或環境變數指定。引擎輸出寫入專屬暫存目錄，再交由 ComfyUI 儲存。
 
