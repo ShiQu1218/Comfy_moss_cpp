@@ -1,236 +1,148 @@
 # Comfy_moss_cpp
 
-將 [mossimage.cpp / MossInfer](https://github.com/mossimage-cpp/mossimage.cpp) 接到 ComfyUI 的獨立採樣節點。使用 ComfyUI V3 API，沿用既有原生節點與標準 `MODEL`、`CONDITIONING`、`LATENT` 連線。
+**English** | [繁體中文](README.zh-TW.md)
 
-最低需求：ComfyUI v0.22.0 以上（需要 4 參數的 `comfy.sample.fix_empty_latent_channels`）；已於 v0.45.4 驗證。
+Standalone ComfyUI sampler node integrating [mossimage.cpp / MossInfer](https://github.com/mossimage-cpp/mossimage.cpp) into native ComfyUI workflows. Built with the ComfyUI V3 API, it plugs directly into standard `MODEL`, `CONDITIONING`, and `LATENT` connections without replacing your text encoder, VAE, LoRA loaders, or workflow layout.
 
-## 速度
+**Minimum requirement:** ComfyUI v0.22.0+ (requires the 4-argument `comfy.sample.fix_empty_latent_channels`; verified on v0.45.4).
 
-![官方 KSampler 與 MOSS C++ 採樣速度比較](docs/speed.png)
+## Speed
 
-本機 RTX 5080 16 GB 實測，統一設定：**1024×1024、`euler`、`simple`、50 步、CFG 3、batch 1**，兩邊使用同一份 INT8 ConvRot 模型；LoRA 組統一掛載原生 `Load LoRA`（`moss_黑白線稿.safetensors`，`strength_model = 0.7`）。計時為採樣節點耗時（從採樣節點開始計到 VAE Decode 開始）；`keep_vram` 的「後續已載入」數據取第 2 張起。
+![Native KSampler vs MOSS C++ Sampling Speed Comparison](docs/speed.png)
 
-- **灰色（官方 KSampler）：** 無 LoRA 首次 89.0 s／已載入 84.2 s；掛載 LoRA 第一次載入 90.3 s／後續已載入 86.2 s。
-- **藍色（MOSS C++，無噪聲預測）：** 無 LoRA 預設 21.9 s（3.8×）、`keep_vram` + `balanced` 15.7 s（5.4×）；掛載 LoRA 第一次載入 21.0～23.3 s（3.9～4.3×）、後續已載入 17.3 s（5.0×）。`keep_engine` 連續生圖省去重載 DiT，輸出像素逐位元相同，見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
-- **橘色（MOSS C++ ＋ 噪聲預測 `forecast_denoise`）：** 無 LoRA 預設 16.0 s（5.3×）、常駐 11.0 s（7.6×）；掛載 LoRA 第一次載入 17.4 s（5.2×）、後續已載入 12.1 s（7.1×）。噪聲預測可能微幅改變文字或細節。
-- 若希望進一步減少步數（例如改用 `dpmpp_2m` + `beta` 20 步），可參考 [採樣數學研究](MATH_ACCELERATION_RESEARCH.md)。
+Measured on a local **RTX 5080 16 GB** under identical settings: **1024×1024, `euler`, `simple`, 50 steps, CFG 3, batch 1**, using the exact same INT8 ConvRot model. The LoRA group uses native `Load LoRA` (`moss_黑白線稿.safetensors`, `strength_model = 0.7`). Timing covers the sampler node execution (from sampler start to VAE Decode start); `keep_vram` subsequent runs are measured from the 2nd image onward.
 
-重新產生圖表：`python docs/speed_chart.py`。
+- **Gray (Native ComfyUI KSampler):** No LoRA: 89.0 s first run / 84.2 s cached; with LoRA: 90.3 s first load / 86.2 s subsequent cached.
+- **Blue (MOSS C++, no forecasting):** No LoRA: 21.9 s default (`3.8×`), 15.7 s with `keep_vram` + `balanced` (`5.4×`); with LoRA: 21.0–23.3 s first load (`3.9–4.3×`), 17.3 s subsequent cached (`5.0×`). Enabling `keep_engine` eliminates per-image DiT reloads with bit-identical pixel output (see [LOSSLESS_ACCELERATION_RESEARCH.md](LOSSLESS_ACCELERATION_RESEARCH.md)).
+- **Orange (MOSS C++ + `forecast_denoise`):** No LoRA: 16.0 s default (`5.3×`), 11.0 s persistent (`7.6×`); with LoRA: 17.4 s first load (`5.2×`), 12.1 s subsequent cached (`7.1×`). Denoise forecasting may slightly alter text or fine details.
+- For further step reduction (e.g., `dpmpp_2m` + `beta` at 20 steps), see [MATH_ACCELERATION_RESEARCH.md](MATH_ACCELERATION_RESEARCH.md).
 
-## 接入現有 workflow
+Regenerate the chart: `python docs/speed_chart.py`.
 
-新增 **KSampler (MOSS Image C++)**，替換原本的 KSampler，接回同樣的四組輸入與 latent 輸出：
+## Installation
 
-| 新節點插槽 | 接既有節點 |
-| --- | --- |
-| `model` | Load Diffusion Model 的 MOSS-Image MODEL |
-| `positive` / `negative` | CLIP Text Encode 的正／負 CONDITIONING |
-| `latent_image` | 官方空白潛在影像（EmptyLatentImage）、EmptySD3LatentImage、EmptyFlux2LatentImage 或原生 VAE Encode 的 LATENT |
-| LATENT 輸出 | 原本的 VAE Decode，再接 SaveImage |
+### Hardware & Environment Requirements
 
-不用重新選 text encoder、VAE、尺寸或輸入 prompt。Diffusion model 的檔案來自輸入 MODEL；文字與 VAE 仍由原生 ComfyUI 處理。種子、步數、CFG、採樣器、scheduler 與 denoise 屬於採樣器設定；和原生 KSampler 一樣，可將 widget 轉成輸入，接既有的數值節點。shift 沿用 MODEL 的 model_sampling。
+- **ComfyUI:** v0.22.0+ (verified on v0.45.4). No extra Python packages required (uses ComfyUI's bundled `torch`, `numpy`, and `Pillow`).
+- **GPU:** **NVIDIA CUDA GPUs only** (non-CUDA / AMD / Intel environments automatically fall back to the native ComfyUI KSampler).
 
-Load Diffusion Model 的 `weight_dtype` 請選 `default`。低 denoise 的離散排程可能重複選到同一個 sigma，此時只執行有變化的步驟。
-
-進階選項 `forecast_denoise` 預設關閉。開啟後，實驗性的去噪預測會依 sigma 步距，用最近兩次完整推論的速度張量外推少數步驟，減少 MossInfer 呼叫。前段、末段、SLG 分支切換時及步距不適合外推時會執行完整推論。速度取決於採樣器與排程，預測可能改變文字或圖像細節。主控台會顯示實際預測的次數。
-
-官方空白 latent 會沿用原生 KSampler 的 `fix_empty_latent_channels`，依 MODEL 將全零 latent 的通道與縮放比例轉成 MOSS 格式，保留原生尺寸轉換規則，不會修改輸入資料。非空白的其他模型 latent 不會被強制當成 MOSS latent。範例：[empty_latent.json](workflows/empty_latent.json)。目前仍限 batch 1；MOSS 的圖片尺寸須配合 16 倍數。
-
-[workflows/modular.json](workflows/modular.json) 是完整可匯入範例，[modular_api.json](workflows/modular_api.json) 是 API 版本。預設為 1024×1024、50 步、ER-SDE、simple、CFG 4。舊的 `MossImageCpp` 整合節點保留，顯示名稱改為 Legacy All-in-One，舊 workflow 不需要改寫。
-
-### LoRA
-
-直接沿用原生 **Load LoRA** 或 **Load LoRA (Model Only)**，將它的 MODEL 接到 C++ 採樣器即可；支援多個 LoRA 串接、正／負 `strength_model` 與 alpha。使用 Load LoRA 時，CLIP 輸出照常接正／負 CLIP Text Encode，`strength_clip` 由原生文字編碼流程處理，不會在 C++ 再套一次。採樣器不需要另外選 LoRA。
-
-[workflows/lora.json](workflows/lora.json) 與 [lora_api.json](workflows/lora_api.json) 提供原生 Load LoRA 的完整範例。範例使用本機的 `moss_黑白線稿.safetensors`，請換成自己的 MOSS-Image LoRA；不會自動下載。
-
-支援的轉送方式：
-
-| 格式 | 處理方式 |
-| --- | --- |
-| 一般 LoRA（含原生已識別的 kohya、PEFT、diffusers 等命名） | 原低秩張量、alpha、正／負強度交給 C++ |
-| 線性 LoHa／LoKr | 保留原因子與原生 alpha 規則，交給 C++ |
-| DoRA、LoCon、Tucker、同形狀 reshape，以及其他原生 WeightAdapter | 用原生 ComfyUI 計算該參數的完整 patch 堆疊，再轉成差值交給 C++ |
-| 完整 diff、bias diff | 交給 C++ 套用 |
-
-完整差值模式會讀取未套用 patch 的原始參數，依原順序處理堆疊與非線性 DoRA；不會再重複套用同一參數的低秩 patch。逐參數計算與寫檔，完成、失敗或取消後清除專屬暫存檔。它會比低秩模式更吃 RAM、暫存磁碟與載入時間；INT8 合併也可能增加重新量化誤差，不能保證逐像素等同原生 PyTorch。
-
-基礎模型與原 LoRA 檔案不會被修改。若原生轉換失敗、產生非有限值、改變模型參數形狀，或 C++ 回報未識別的 adapter，會停止輸出。仍需使用與 MOSS-Image 架構相容的 LoRA；其他模型的卷積／改變通道數等 adapter 不會因此變成相容。
-
-驗證見 [LORA_TEST_REPORT.md](LORA_TEST_REPORT.md)；數值回歸測試可用 ComfyUI 的 Python 執行 `tests/test_lora.py`。
-
-若採樣前等待較久，可查看主控台的 `MossInfer preparation`：分別記錄卸載、LoRA 匯出、server 初始化、run_begin 與首次評估耗時。進度條會先顯示 0%，載入完才開始計入採樣步數。LoHa／LoKr 在此引擎可能需要載入時合併，INT8 還要重新量化；單一作用範圍大的 adapter 就可能花數十秒，不能只按啟用檔案數預估成本。LoKr 現可使用下述磁碟快取，避免重複合併。Power Loader 比對結果見 [POWER_LORA_PROFILE.md](POWER_LORA_PROFILE.md)。
-
-### 跳層引導（SLG）
-
-可直接保留原生 **SkipLayerGuidanceDiTSimple** 與 **SkipLayerGuidanceDiT**，把 MODEL 輸出接到 C++ 採樣器：
-
-- Simple：只在原本的 sigma 區間內，替負向分支跳過指定層。
-- 完整 SLG：依原 scale 增加跳層正向分支，保留 start／end percent 與 rescaling_scale。支援多個完整 SLG 串接，也能與 Simple、LoRA 同時使用。
-- MOSS 只有 `single_block`，因此 `single_layers` 才會跳層；`double_layers` 與原生 MOSS 一樣沒有作用。每層有效索引為 0～41。
-- 依引擎上限，一個 component session 最多 8 個 prediction rows（含正／負分支與額外跳層分支）；超過會明確報錯。
-
-[workflows/slg.json](workflows/slg.json)／[slg_api.json](workflows/slg_api.json) 展示原生 Load LoRA → Simple → 完整 SLG → C++ 採樣器，其他文字與 VAE 節點不需更換。驗證見 [EXTENDED_TEST_REPORT.md](EXTENDED_TEST_REPORT.md)。目前辨識的是本機 ComfyUI 的這兩種原生 SLG callback，其他插件的任意 MODEL callback 仍會拒絕。
-
-此介面使用 MossInfer component session，透過共享記憶體匯入原生 conditioning 與 latent，由原生 ComfyUI 採樣演算法執行迴圈、C++ 執行 DiT，不是重新拼回文字生圖命令。因此先前整合節點的速度數據不能直接套用。
-
-目前支援原生 Load Diffusion Model 的 MOSS-Image、上述 adapter 與原生 SLG、單張 batch、單組正／負 conditioning、無 mask 的 latent，以及下述參考圖；不支援 ControlNet、區域或時間排程 conditioning、其他 MODEL callback。遇到這些設定會明確報錯，不會靜默忽略。其他模型請使用原生採樣器。
-
-### 參考圖（ReferenceLatent）
-
-原生 **ReferenceLatent** 的參考 latent 可交給 C++ 引擎：參考圖的 KV 在 run_begin 時計算一次，之後每一步重用。條件如下，不符合時會在主控台警告 `using the native sampler` 並改用原生 KSampler，不會報錯：
-
-- 正、負 conditioning 帶相同的參考 latent，且 `reference_latents_method` 為 `index_timestep_zero_text_start`（Moss-Image-Edit 的位置排列）。
-- 最多 4 張，合計不超過 16384 個 latent token；不能與 MOSS SLG 同時使用。
-- 需要套用 [patches/mossinfer-2.2.1-reference-latents.patch](patches/mossinfer-2.2.1-reference-latents.patch) 的 `moss-server`（`hello` 回報 `run_reference_latents`）。官方 2.2.1 套件沒有這項功能，會自動退回原生採樣。
-
-本機 RTX 5080、1024×1024、20 步、CFG 4、一張 768×1024 參考圖：原生 62.5 秒，C++ 13.3 秒。與原生輸出的相對差距和無參考圖時的 INT8 誤差同級，可用 `scripts/check_reference_latents.py` 以合成輸入重測。
-
-#### 編譯參考圖版引擎
-
-```powershell
-git clone https://github.com/mossimage-cpp/mossimage.cpp
-cd mossimage.cpp
-git checkout f4f38f5e90d9990795d125b357574a68aadbe924
-git apply <本 repo>/patches/mossinfer-2.2.1-reference-latents.patch
-cmake --preset windows-msvc-cuda13 -DCMAKE_CUDA_ARCHITECTURES=120-real   # 依顯示卡調整
-cmake --build build/windows-msvc-cuda13 --target moss-server mossinfer
-```
-
-將產生的 `moss-server.exe` 與 `mossinfer.dll` 覆蓋官方套件 `runtime/<套件名稱>/bin/` 內的同名檔（建議先備份），其餘 DLL 沿用官方套件。
-
-進階選項包含 bundle 設定目錄、tier、memory_mode 與 cache_lokr。上游 component API 即使只跑 DiT 仍會檢查文字編碼器與 VAE 的標頭，因此本機仍需有相容的 `qwen3.5_9b*` 文字編碼器與 `flux2*` VAE 元件檔；會從標準模型搜尋路徑選取第一個符合名稱的檔案供標頭檢查，不會以它們取代輸入的 conditioning 或執行解碼。這些模型的安裝方式如下。
-
-VRAM 足夠時，可將獨立採樣器的 `memory_mode` 設為 `balanced`，讓引擎優先將 DiT 權重留在 GPU。另可開啟進階選項 `cuda_graphs`，在全部 DiT 權重常駐且推論形狀重複時啟用 CUDA Graph。若引擎選擇串流權重，則沿用一般 fused 路徑。`cuda_graphs` 預設關閉。逐位元比對與本機量測方式見 [硬體加速報告](HARDWARE_BITWISE_RESEARCH.md)。
-
-進階選項 `keep_engine` 可在連續生圖時保留 C++ 引擎程序，省去每張圖重新載入 DiT 的時間，輸出像素與關閉時逐位元相同。設定如下：
-
-| 設定 | 兩張圖之間 | 本機 20 步採樣（第 2 張起） |
-| --- | --- | ---: |
-| `off`（預設） | 每張結束即關閉程序 | 10.4 s |
-| `release_vram` | 程序保留，DiT 釋放 VRAM，下張重新載入約 0.4 s；仍佔約 0.2 GB | 7.8 s |
-| `keep_vram` | DiT 留在 VRAM：`min_memory` 約 1.6 GB、`balanced` 約 7.1 GB | 7.7 s／6.4 s（balanced） |
-
-`release_vram` 在 RAM 足夠時會把 DiT 副本留在主機 RAM（本機 `balanced` 約 5.4 GB；`min_memory` 因 RAM 不足而未保留）。`keep_vram` 佔用的 VRAM 不受 ComfyUI 管理，同一個 ComfyUI 再載入其他大型模型時可能 OOM。更換 DiT（含同路徑替換檔案）、tier、memory_mode 或 cuda_graphs，或採樣失敗、取消時，會關閉舊程序並重新啟動。LoKr 磁碟快取的每一組都有獨立檔名，也能使用 `keep_engine`。數據與驗證見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
-
-### LoKr 載入快取
-
-獨立採樣器預設開啟進階選項 `cache_lokr`。第一次把 LoKr 合併至一份獨立的 DiT 檔；後續相同模型、LoKr 組合及強度直接載入這份檔案，跳過每張圖重做的合併與 INT8 重新量化。更換提示詞、seed、尺寸、步數或 SLG 不需重建。沿用原生或 rgthree Power LoRA Loader 的接法即可，原始模型不會被修改。
-
-快取保留最近使用的 3 組（`lokr_cache.py` 的 `CACHE_SLOTS`），位於本節點的 `cache/lokr/`，每組占用一份 DiT 的磁碟空間（MOSS SFT INT8 約 5.4 GB，3 組約 16 GB）；建立新組合時暫時再需要一份。在已快取的組合之間切換不需重建；超過 3 組時刪除最久未用的一組，若該檔仍被常駐引擎使用則改刪下一組。舊版的單一快取檔 `merged.safetensors` 會在第一次建立新快取時移除。修改 LoKr 內容／強度、來源模型路徑／大小／修改時間或 helper 版本會重建。不在 RAM／VRAM 常駐合併模型；重啟 ComfyUI 仍可重用磁碟快取。Ampere 及更新的 GPU 會照常即時套用普通 LoRA，包含區塊 side branch，以及與 LoKr 作用於不同權重的文字嵌入、時間調節與輸出層。舊 GPU 上混用一般 LoRA 與 LoKr、其他非線性 adapter 混用、特殊 patch、turbo 或不相容權重會沿用原本載入方式。快取失敗時會警告並退回原流程。
-
-這份磁碟快取不會在採樣結束時刪除；關閉 `cache_lokr` 也只停止使用快取。需要釋放磁碟空間時，先停止所有正在使用此節點的工作，再刪除 `cache/lokr/`。下次啟用時會重新合併。C++ 引擎程序及其 RAM／VRAM 預設於每次採樣結束後回收（`keep_engine` 開啟時除外）。
-
-需要本機 helper `runtime/moss-lokr-cache.exe`（Linux 不含 `.exe`），此工作區已編譯安裝。它直接編譯固定版本上游的 CPU LoKr 合併與重新量化函式，原樣複製模型標頭與未修改的張量。重建方式見 [native/README.md](native/README.md)；未安裝 helper 時會提示並使用原流程。
-
-## 安裝
-
-### 環境與顯卡需求
-
-- **ComfyUI**：v0.22.0 以上（已於 v0.45.4 驗證）；不需要額外安裝 Python 套件（沿用 ComfyUI 內建的 `torch`、`numpy`、`Pillow`）。
-- **顯卡**：僅支援 **NVIDIA CUDA GPU**（AMD／Intel／無 CUDA 環境會自動退回原生 KSampler）。
-
-| 顯卡世代 | 架構 | 適用引擎套件 | 最低驅動版本 |
+| GPU Generation | Architecture | Engine Package | Minimum Driver |
 | --- | --- | --- | --- |
-| RTX 50 / 40 / 30 系列（含 A100 / L40 等） | Ampere / Ada / Blackwell | 標準套件（CU13 或 CU12） | CU13：≥ 580<br>CU12：Win ≥ 527／Linux ≥ 525 |
-| RTX 20 / GTX 16 系列 | Turing (`sm_75`) | 上游 **`-sm75`** 專用套件 | ≥ 580 |
-| Tesla V100 | Volta (`sm_70`) | Linux CUDA 12 **`-sm70`** 套件 | ≥ 525 |
+| RTX 50 / 40 / 30 series (incl. A100 / L40) | Ampere / Ada / Blackwell | Standard package (CU13 or CU12) | CU13: ≥ 580<br>CU12: Win ≥ 527 / Linux ≥ 525 |
+| RTX 20 / GTX 16 series | Turing (`sm_75`) | Upstream **`-sm75`** package | ≥ 580 |
+| Tesla V100 | Volta (`sm_70`) | Linux CUDA 12 **`-sm70`** package | ≥ 525 |
 
-> `turbo` 模式的 NVFP4 僅限 RTX 50 系列；RTX 30／40 系列請使用 `high`（INT8）或 `reference`（BF16）。
+> `turbo` NVFP4 weights require an RTX 50 series GPU. On RTX 30 / 40 series, use `high` (INT8) or `reference` (BF16).
 
-### 方式一：Windows 懶人包（推薦，RTX 30 / 40 / 50 系列、驅動 ≥ 580）
+### Option 1: Windows All-in-One Package (Recommended for RTX 30 / 40 / 50, Driver ≥ 580)
 
-1. 前往本專案的 [Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) 下載 **`Comfy_moss_cpp-v1.0.0-windows-cu13-allinone.zip`**（已內含官方原版 `mossinfer-2.2.1-windows-cu13-x86_64` 與 `moss-lokr-cache.exe`）。
-2. 將 zip 解壓縮到 `ComfyUI/custom_nodes/`，確認資料夾結構為 `ComfyUI/custom_nodes/Comfy_moss_cpp/__init__.py`（不要多包一層目錄）。
-3. 繼續下方「準備模型設定檔與權重」，完成後重新啟動 ComfyUI。
+1. Download **`Comfy_moss_cpp-v1.0.0-windows-cu13-allinone.zip`** from [GitHub Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) (bundles the official `mossinfer-2.2.1-windows-cu13-x86_64` runtime and `moss-lokr-cache.exe`).
+2. Extract it into `ComfyUI/custom_nodes/` so the path is `ComfyUI/custom_nodes/Comfy_moss_cpp/__init__.py` (avoid nested duplicate folders).
+3. Follow **Model Configs & Weights** below, then restart ComfyUI.
 
-### 方式二：手動安裝（Linux、CUDA 12 舊驅動、RTX 20 系列 `-sm75`）
+### Option 2: Manual Installation (Linux, CUDA 12 Drivers, or RTX 20 `-sm75`)
 
-1. 在 `ComfyUI/custom_nodes/` 內複製本專案（或下載 Release 內的純 node 包 `Comfy_moss_cpp-v1.0.0.zip` 解壓）：
+1. Clone this repository into `ComfyUI/custom_nodes/` (or extract `Comfy_moss_cpp-v1.0.0.zip` from Releases):
    ```powershell
    git clone https://github.com/ShiQu1218/Comfy_moss_cpp.git
    ```
-2. 前往上游 [MossInfer v2.2.1 Release](https://github.com/mossimage-cpp/mossimage.cpp/releases/tag/v2.2.1)，下載符合你作業系統、顯卡架構與驅動版本的套件（例如 `windows-cu12`、`windows-cu13-sm75`、`linux-cu13` 等），核對 `SHA256SUMS` 後將**完整套件**解壓到本目錄的 `runtime/`。
-   - 預期位置：`Comfy_moss_cpp/runtime/<套件名稱>/bin/moss-infer.exe`（Linux 為 `moss-infer`）。
-   - `runtime/` 內只放一個版本；不可只複製執行檔，必須保留同目錄下的全部 DLL／函式庫。也可在啟動 ComfyUI 前設定環境變數 `MOSSIMAGE_CPP_EXECUTABLE` 指向執行檔。
-3. 繼續下方「準備模型設定檔與權重」，完成後重新啟動 ComfyUI。
+2. Download the matching binary package for your OS, GPU, and CUDA driver from the upstream [MossInfer v2.2.1 Release](https://github.com/mossimage-cpp/mossimage.cpp/releases/tag/v2.2.1) (e.g., `windows-cu12`, `windows-cu13-sm75`, `linux-cu13`). Verify `SHA256SUMS` and extract the **entire package** into `Comfy_moss_cpp/runtime/`.
+   - Expected path: `Comfy_moss_cpp/runtime/<package-name>/bin/moss-infer.exe` (`moss-infer` on Linux).
+   - Keep only one runtime package in `runtime/`, and keep all accompanying DLLs / shared libraries. Alternatively, set `MOSSIMAGE_CPP_EXECUTABLE` before starting ComfyUI.
+3. Follow **Model Configs & Weights** below, then restart ComfyUI.
 
-### 準備模型設定檔與權重
+### Model Configs & Weights
 
-1. 下載官方 MOSS-Image SFT（或 Base）的設定檔與 tokenizer（只下載小檔，不含大權重；請將路徑換成你的 ComfyUI 目錄）：
+1. Download the official MOSS-Image SFT (or Base) config and tokenizer files (small metadata files only; replace the target path with your ComfyUI directory):
 
 ```powershell
 hf download OpenMOSS-Team/MOSS-Image-SFT --revision 2c7954437269461767f533b006823e8f85973a60 --include '*/config.json' --include 'tokenizer/*' --include 'model_index.json' --include 'scheduler/*' --local-dir 'D:/ComfyUI/ComfyUI_windows_portable/ComfyUI/models/mossimage/MOSS-Image-SFT'
 ```
 
-2. 將相容的元件權重放入 ComfyUI 標準模型目錄：
+2. Place compatible model weights in ComfyUI's standard model folders:
 
-| 元件 | 目錄 | 範例 workflow 使用的檔名 |
+| Component | Directory | Example Filename |
 | --- | --- | --- |
 | DiT | `models/diffusion_models/` | `moss_image_sft_int8_convrot.safetensors` |
-| 文字編碼器 | `models/text_encoders/` | `qwen3.5_9b_int8_convrot.safetensors` |
+| Text Encoder | `models/text_encoders/` | `qwen3.5_9b_int8_convrot.safetensors` |
 | VAE | `models/vae/` | `flux2-vae_small.safetensors` |
 
-設定目錄與元件須符合相同架構；上游引擎會拒絕不支援的模型。現有 `unet` 等 ComfyUI 設定的模型搜尋路徑也會沿用。
+3. Restart ComfyUI. In any MOSS-Image workflow, replace the native `KSampler` with **KSampler (MOSS Image C++)** — or import [workflows/modular.json](workflows/modular.json).
 
-3. 重啟 ComfyUI 後，在既有 MOSS-Image workflow 中將原本的 `KSampler` 換成 **KSampler (MOSS Image C++)**（或直接匯入 [workflows/modular.json](workflows/modular.json)）即可開始使用。
+## Integrating into Existing Workflows
 
-## 舊整合節點與測試
+Add **KSampler (MOSS Image C++)** in place of the standard `KSampler` and wire the same four inputs and latent output:
 
-把 [workflows/txt2img.json](workflows/txt2img.json) 拖進 ComfyUI，確認模型選項後執行。流程為 `MOSS Image (mossimage.cpp) → SaveImage`，固定種子 42、512×512、12 步，適合快速驗證；正式產圖可提高到 1024×1024、50 步。
-
-API 版本為 [workflows/txt2img_api.json](workflows/txt2img_api.json)，可用 ComfyUI 的 Python 執行：
-
-```powershell
-python scripts/test_workflow.py --url http://127.0.0.1:8188
-$env:COMFYUI_PATH = 'D:/ComfyUI/ComfyUI_windows_portable/ComfyUI'
-python tests/test_nodes.py
-```
-
-節點提供 `sampler` 與 `scheduler`，舊 workflow 預設沿用 `euler`／`moss`。執行後會在 ComfyUI 日誌輸出引擎各階段耗時。
-
-速度比較使用 [C++ workflow](workflows/benchmark_cpp.json) 與 [原生 workflow](workflows/benchmark_native.json)：50 步、1024×1024、ER-SDE、simple、CFG 4、shift 5，使用相同的 INT8 權重、提示詞與種子。兩邊的負向分支都跳過第 22 層，沒有 LoRA 或額外加速快取。測試前先確認其他 GPU 工作已結束。
-
-```powershell
-python scripts/benchmark.py --url http://127.0.0.1:8189 --runs 2
-```
-
-此命令會在指定的 ComfyUI 上依序測試，先各跑兩輪（每輪清除 ComfyUI 執行快取並卸載模型），再保留原生模型快取改用種子 43 重跑，最後以種子 43 測試 C++ 節點。作業系統的檔案快取不清除。每次記錄 websocket 執行事件、整體時間與輸出至 `test_results/benchmark/`；若採樣或輸出節點被快取跳過，測試會失敗。C++ 節點每次都會重新載入模型，因此不具備原生流程的常駐模型優勢。
-
-測試程式實際提交 workflow，檢查執行狀態與 SaveImage 結果，將紀錄存到 `test_results/workflow_result.json`。產圖位於 ComfyUI 的 `output/`，前綴 `mossimage_cpp_test`。單元測試使用替代程序驗證參數、圖片格式、錯誤與取消清理，不會載入 GPU 模型。
-
-## 範圍與限制
-
-- 舊整合節點支援文字生圖。獨立採樣器的 LoRA 與 latent 輸入限制見上文。
-- `high` 搭配 INT8 DiT；`reference` 需要 bf16 DiT；`turbo` 需要上游支援的 INT4 / NVFP4 DiT。品質模式不會自動轉換權重。
-- 預設 `min_memory`。執行前會卸載同一個 ComfyUI 程序內快取的模型，讓出 VRAM。其他程序占用的 VRAM 需自行釋放。
-- 預設每張圖啟動一次引擎，完成或取消後回收程序與暫存檔；連續生圖可用 `keep_engine` 保留程序。取消會終止專屬的子程序。
-- 此節點呼叫 CUDA 版 `moss-infer`；所需 GPU 與驅動以該套件為準。未驗證 Vulkan / HIP 引擎。
-- 節點執行時不會下載模型或執行 shell；執行檔只能由本機安裝或環境變數指定。引擎輸出寫入專屬暫存目錄，再交由 ComfyUI 儲存。
-
-獨立採樣器另外以 `tests/test_modular.py` 驗證原生 conditioning、patch 拒絕、共享記憶體身分檢查及 component 請求格式。與舊節點一樣，執行前卸載 PyTorch 模型快取，完成／失敗／取消後回收專屬 C++ 程序；不會常駐占用 GPU。
-
-上游版本：2.2.1，原始碼 commit `f4f38f5e90d9990795d125b357574a68aadbe924`。上游二進位套件的授權與 CUDA notices 保留在 `runtime/` 內。
-
-### GPU LoKr 合併
-
-LoKr 快取建立已加入 GPU 分塊合併，無 CUDA 或 GPU 失敗時沿用 CPU。單組快取與磁碟空間需求不變。本機完整模型量測由約 51 秒降至 18 秒，輸出權重逐位元相同；詳見 [GPU_LOKR_REPORT.md](GPU_LOKR_REPORT.md)。
-
-
-### DoRA LoKr 快取
-
-已支援一般 LoKr 與 DoRA LoKr 組合的合併快取；首次建立逐層使用 ComfyUI 原生計算並由 GPU 重新量化，命中後重用完整模型。首次建立可能額外需要約 20 GB 以上差值暫存空間，詳見 [DORA_CACHE_REPORT.md](DORA_CACHE_REPORT.md)。
-
-
-## 參考專案
-
-| 專案 | 用途 |
+| Node Input / Output | Connect To |
 | --- | --- |
-| [mossimage.cpp / MossInfer](https://github.com/mossimage-cpp/mossimage.cpp)（Apache-2.0） | C++ 推論引擎與 component session 協定；`patches/` 是對 2.2.1（`f4f38f5`）的修改，LoKr helper 直接編譯其合併與量化函式 |
-| [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | 節點 API、原生採樣迴圈、LoRA／WeightAdapter、SkipLayerGuidance 與 ReferenceLatent 的行為依據 |
-| [OpenMOSS MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 模型架構、設定檔與 tokenizer；參考圖位置排列沿用 Moss-Image-Edit 的 `index_timestep_zero_text_start` |
-| [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) | Power LoRA Loader 相容性與效能比對 |
-| [Dao-AILab fast-hadamard-transform](https://github.com/Dao-AILab/fast-hadamard-transform)、[FlashAttention](https://arxiv.org/abs/2205.14135) | 數學等價加速研究的參考 |
-| [NVIDIA CUDA 文件](https://docs.nvidia.com/cuda/) | cuBLAS 可重現性、浮點與非同步傳輸的依據 |
+| `model` | `Load Diffusion Model` (MOSS-Image `MODEL`) |
+| `positive` / `negative` | `CLIP Text Encode` positive / negative `CONDITIONING` |
+| `latent_image` | `EmptyLatentImage`, `EmptySD3LatentImage`, `EmptyFlux2LatentImage`, or native `VAE Encode` `LATENT` |
+| `LATENT` output | Native `VAE Decode` → `SaveImage` |
 
-`patches/` 內的檔案為 mossimage.cpp 的衍生修改，依 Apache-2.0 散布；其餘程式碼另行授權前請勿假設任何授權。
+- Keep `weight_dtype` set to `default` on `Load Diffusion Model`. Text encoding and VAE decoding remain handled by native ComfyUI; only the DiT denoising loop runs in C++ via shared memory.
+- Currently limited to batch size 1; image dimensions must be multiples of 16.
+- **Advanced option `forecast_denoise`** (default `False`): experimental velocity extrapolation across nearby sigma steps to skip selected DiT evaluations. May alter text or fine details.
+- **Advanced options `memory_mode` & `cuda_graphs`**: when VRAM allows, set `memory_mode` to `balanced` to keep DiT weights resident on GPU, and optionally enable `cuda_graphs` for repeated shapes. See [HARDWARE_BITWISE_RESEARCH.md](HARDWARE_BITWISE_RESEARCH.md).
+- **Advanced option `keep_engine`** (`off` / `release_vram` / `keep_vram`, default `off`): keeps the C++ `moss-server` process alive between images to avoid reloading the DiT each run, producing bit-identical pixels.
+  - `release_vram`: frees VRAM between runs (keeps a host RAM copy if memory allows; reload takes ~0.4 s).
+  - `keep_vram`: keeps DiT resident in VRAM (`min_memory` ~1.6 GB, `balanced` ~7.1 GB) for maximum speed. Note that ComfyUI does not manage this VRAM, so loading other large models in the same ComfyUI instance may OOM.
+  - Automatically restarts the server if the DiT file, tier, memory mode, or CUDA Graph setting changes, or on error/cancellation.
+
+### LoRA / LoHa / LoKr / DoRA
+
+Use native **Load LoRA**, **Load LoRA (Model Only)**, or **rgthree Power LoRA Loader** as usual and connect the resulting `MODEL` to **KSampler (MOSS Image C++)**. Multiple stacked LoRAs, positive/negative strengths, and alphas are supported (`strength_clip` is handled natively by ComfyUI's CLIP path).
+
+| Adapter Format | Handling |
+| --- | --- |
+| Standard LoRA (kohya, PEFT, diffusers) | Passed directly as low-rank tensors, alpha, and strength to C++ |
+| Linear LoHa / LoKr | Passed with original factors and native alpha rules to C++ |
+| DoRA, LoCon, Tucker, other native WeightAdapters | Computed natively via ComfyUI's patch stack and forwarded as weight deltas |
+| Full diff / bias diff | Applied directly in C++ |
+
+#### LoKr & DoRA Disk Cache (`cache_lokr`)
+
+Enabled by default. Merging and INT8-requantizing large LoKr adapters can take tens of seconds per run. With `cache_lokr` enabled, the first run merges the adapter into a cached DiT file under `cache/lokr/` (GPU-accelerated via `runtime/moss-lokr-cache.exe`, reducing full-model merge from ~51 s on CPU to ~10.7–18 s with bit-identical weights; falls back to CPU automatically if CUDA is unavailable). Subsequent runs with the same model, adapter set, and strengths load directly from disk, even across ComfyUI restarts. Only the most recent combination is cached (~1× DiT disk size). See [GPU_LOKR_REPORT.md](GPU_LOKR_REPORT.md) and [DORA_CACHE_REPORT.md](DORA_CACHE_REPORT.md).
+
+### Skip Layer Guidance (SLG)
+
+Directly supports native **SkipLayerGuidanceDiTSimple** and **SkipLayerGuidanceDiT** (including stacked SLG + LoRA). MOSS-Image only has `single_block` layers (valid indices `0–41`); up to 8 total prediction rows per session are supported by the engine. See [workflows/slg.json](workflows/slg.json) and [EXTENDED_TEST_REPORT.md](EXTENDED_TEST_REPORT.md).
+
+### Reference Images (`ReferenceLatent`)
+
+Supports native **ReferenceLatent** in C++ (reference KV states are computed once at `run_begin` and reused across all steps):
+- Positive and negative conditioning must carry identical reference latents with `reference_latents_method = index_timestep_zero_text_start` (up to 4 images, ≤ 16,384 total latent tokens; cannot be combined with SLG).
+- Requires a `moss-server` built with [patches/mossinfer-2.2.1-reference-latents.patch](patches/mossinfer-2.2.1-reference-latents.patch). If the installed `moss-server` does not advertise `run_reference_latents` (such as the stock upstream v2.2.1 binary), the node automatically warns and falls back to the native KSampler without failing.
+- Measured on RTX 5080 (1024×1024, 20 steps, CFG 4, one 768×1024 reference image): native 62.5 s → C++ **13.3 s** (`4.7×`).
+
+#### Building the Reference-Latent Server (Optional)
+
+```powershell
+git clone https://github.com/mossimage-cpp/mossimage.cpp
+cd mossimage.cpp
+git checkout f4f38f5e90d9990795d125b357574a68aadbe924
+git apply <this-repo>/patches/mossinfer-2.2.1-reference-latents.patch
+cmake --preset windows-msvc-cuda13 -DCMAKE_CUDA_ARCHITECTURES=120-real   # adjust for your GPU
+cmake --build build/windows-msvc-cuda13 --target moss-server mossinfer
+```
+
+Replace `moss-server.exe` and `mossinfer.dll` inside `runtime/<package-name>/bin/` (back up the originals first).
+
+## Scope & Limitations
+
+- The legacy all-in-one node (`MossImageCpp`) is preserved for backward compatibility with older workflows.
+- `high` pairs with INT8 DiT; `reference` requires BF16 DiT; `turbo` requires upstream-supported INT4 / NVFP4 DiT. Weights are not auto-converted between precisions.
+- ControlNet, regional/scheduled conditioning, noise masks, batch size > 1, and arbitrary third-party `MODEL` callbacks are not supported in C++ and will raise an explicit error (or fall back where noted).
+- Upstream baseline: MossInfer **2.2.1** (commit `f4f38f5e90d9990795d125b357574a68aadbe924`).
+
+## References & License
+
+| Project | Role |
+| --- | --- |
+| [mossimage.cpp / MossInfer](https://github.com/mossimage-cpp/mossimage.cpp) (Apache-2.0) | C++/CUDA inference engine & component session protocol; `patches/` modifies v2.2.1 (`f4f38f5`), and the LoKr helper compiles its merge/quantization routines |
+| [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | Node V3 API, native sampling loops, LoRA/WeightAdapter, SLG, and ReferenceLatent semantics |
+| [OpenMOSS MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | Model architecture, configs, and tokenizer |
+| [rgthree-comfy](https://github.com/rgthree/rgthree-comfy) | Power LoRA Loader compatibility and profiling |
+| [Dao-AILab fast-hadamard-transform](https://github.com/Dao-AILab/fast-hadamard-transform), [FlashAttention](https://arxiv.org/abs/2205.14135), [NVIDIA CUDA Docs](https://docs.nvidia.com/cuda/) | References for mathematical equivalence and hardware reproducibility research |
+
+Files under `patches/` are derivative works of `mossimage.cpp` distributed under **Apache-2.0**. Upstream binary licenses and CUDA notices are preserved in `runtime/`. For all other files in this repository, do not assume a license until one is explicitly added.

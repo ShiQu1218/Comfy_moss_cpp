@@ -16,22 +16,22 @@ TEXT, MUTED, GRID = "#191919", "#666666", "#e6e6e6"
 
 # (label, seconds, color, speedup_baseline_seconds or None)
 NO_LORA_ROWS = [
-    ("官方 KSampler（首次載入）", 88.982, NATIVE, None),
-    ("官方 KSampler（已載入模型）", 84.236, NATIVE, None),
-    ("MOSS C++（預設 min_memory）", 21.914, CPP, 84.236),
-    ("MOSS C++（預設 ＋ 噪聲預測）", 16.024, FORECAST, 84.236),
-    ("MOSS C++（keep_vram ＋ balanced）", 15.711, CPP, 84.236),
-    ("MOSS C++（keep_vram ＋ balanced ＋ 噪聲預測）", 11.018, FORECAST, 84.236),
+    ("Native KSampler (first run)", 88.982, NATIVE, None),
+    ("Native KSampler (model cached)", 84.236, NATIVE, None),
+    ("MOSS C++ (default min_memory)", 21.914, CPP, 84.236),
+    ("MOSS C++ (default + forecast)", 16.024, FORECAST, 84.236),
+    ("MOSS C++ (keep_vram + balanced)", 15.711, CPP, 84.236),
+    ("MOSS C++ (keep_vram + balanced + forecast)", 11.018, FORECAST, 84.236),
 ]
 
 LORA_ROWS = [
-    ("官方 KSampler ＋ LoRA（第一次載入）", 90.349, NATIVE, None),
-    ("官方 KSampler ＋ LoRA（後續已載入）", 86.164, NATIVE, None),
-    ("MOSS C++ ＋ LoRA（第一次載入，預設）", 23.266, CPP, 90.349),
-    ("MOSS C++ ＋ LoRA（第一次載入，balanced）", 21.017, CPP, 90.349),
-    ("MOSS C++ ＋ LoRA（第一次載入，預設 ＋ 噪聲預測）", 17.358, FORECAST, 90.349),
-    ("MOSS C++ ＋ LoRA（後續已載入，keep_vram ＋ balanced）", 17.281, CPP, 86.164),
-    ("MOSS C++ ＋ LoRA（後續已載入，keep_vram ＋ balanced ＋ 噪聲預測）", 12.118, FORECAST, 86.164),
+    ("Native KSampler + LoRA (first load)", 90.349, NATIVE, None),
+    ("Native KSampler + LoRA (subsequent cached)", 86.164, NATIVE, None),
+    ("MOSS C++ + LoRA (first load, default)", 23.266, CPP, 90.349),
+    ("MOSS C++ + LoRA (first load, balanced)", 21.017, CPP, 90.349),
+    ("MOSS C++ + LoRA (first load, default + forecast)", 17.358, FORECAST, 90.349),
+    ("MOSS C++ + LoRA (cached, keep_vram + balanced)", 17.281, CPP, 86.164),
+    ("MOSS C++ + LoRA (cached, keep_vram + balanced + forecast)", 12.118, FORECAST, 86.164),
 ]
 
 
@@ -42,7 +42,7 @@ def draw_panel(ax, title, rows, xmax):
     colors = [r[2] for r in ordered]
     ax.barh(labels, values, color=colors, height=0.62)
     for y, (_, value, _, base) in enumerate(ordered):
-        note = "" if base is None else f"  ({base / value:.1f}×)"
+        note = "" if base is None else f"  ({base / value:.1f}x)"
         ax.text(value + 1.0, y, f"{value:.1f} s{note}", va="center", fontsize=8.8, color=TEXT)
     ax.set_xlim(0, xmax)
     ax.set_title(title, color=TEXT, fontsize=10.5, loc="left", fontweight="bold", pad=6)
@@ -56,21 +56,21 @@ def draw_panel(ax, title, rows, xmax):
 
 
 def main():
-    plt.rcParams["font.family"] = ["Microsoft JhengHei", "sans-serif"]
+    plt.rcParams["font.family"] = ["Segoe UI", "DejaVu Sans", "sans-serif"]
     fig, (ax1, ax2) = plt.subplots(
         2,
         1,
-        figsize=(10.5, 6.8),
+        figsize=(10.8, 6.8),
         dpi=150,
         gridspec_kw={"height_ratios": [len(NO_LORA_ROWS), len(LORA_ROWS)]},
     )
     xmax = 108.0
-    draw_panel(ax1, "無 LoRA（倍率相對官方已載入模型）", NO_LORA_ROWS, xmax)
-    draw_panel(ax2, "掛載 LoRA：第一次載入 vs 後續已載入（倍率相對同條件官方 KSampler）", LORA_ROWS, xmax)
-    ax2.set_xlabel("採樣節點耗時（秒，越短越快；從採樣節點開始計至 VAE Decode 開始）", color=MUTED, fontsize=9)
+    draw_panel(ax1, "No LoRA (speedup vs. cached Native KSampler)", NO_LORA_ROWS, xmax)
+    draw_panel(ax2, "With LoRA: First Load vs. Subsequent Cached (speedup vs. matching Native KSampler)", LORA_ROWS, xmax)
+    ax2.set_xlabel("Sampler node time (seconds, lower is faster; measured from sampler start to VAE Decode start)", color=MUTED, fontsize=9)
 
     fig.suptitle(
-        "官方 KSampler vs MOSS C++ 速度比較（RTX 5080，1024×1024，euler / simple / 50 步 / CFG 3）",
+        "Native KSampler vs. MOSS C++ Speed (RTX 5080, 1024x1024, euler / simple / 50 steps / CFG 3)",
         color=TEXT,
         fontsize=11.5,
         fontweight="bold",
@@ -79,9 +79,9 @@ def main():
         y=0.975,
     )
     handles = [
-        Patch(color=NATIVE, label="官方 KSampler（基準）"),
-        Patch(color=CPP, label="MOSS C++（無噪聲預測）"),
-        Patch(color=FORECAST, label="MOSS C++ ＋ 噪聲預測（forecast_denoise）"),
+        Patch(color=NATIVE, label="Native KSampler (baseline)"),
+        Patch(color=CPP, label="MOSS C++ (no forecast)"),
+        Patch(color=FORECAST, label="MOSS C++ + forecast_denoise"),
     ]
     fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.015, 0.945), ncol=3, frameon=False, fontsize=8.8)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.895))
