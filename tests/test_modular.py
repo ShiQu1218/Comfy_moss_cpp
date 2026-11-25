@@ -354,13 +354,12 @@ class ModularTests(unittest.TestCase):
         cached.close.assert_called_once_with()
         self.assertIsNone(sampler.cached_engine)
 
-    def test_keep_engine_skips_the_shared_lokr_cache_file(self):
-        sessions = self.keep_engine_runs(["keep_vram", "keep_vram"], dit_file="merged.safetensors")
-        self.assertEqual(len(sessions), 2)
-        for session in sessions:
-            session.close.assert_called_once_with()
-            session.finish.assert_not_called()
-        self.assertIsNone(sampler.cached_engine)
+    def test_keep_engine_reuses_a_lokr_cache_slot(self):
+        # Each LoKr combination has its own cache file, so a kept engine never sees rewritten weights.
+        sessions = self.keep_engine_runs(["keep_vram", "keep_vram"], dit_file="merged-0123456789abcdef.safetensors")
+        self.assertEqual(len(sessions), 1)
+        sessions[0].close.assert_not_called()
+        sampler.cached_engine = None
 
     def test_session_key_tracks_dit_file_identity(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -37,6 +37,52 @@ class CacheTests(unittest.TestCase):
     def load(self, enabled=True):
         return cache.cached_lokr(self.model, str(self.source), self.root, enabled=enabled)
 
+    def manifest(self):
+        manifest, = cache.CACHE_ROOT.glob("merged-*.json")
+        return manifest
+
+    def use(self, strength):
+        self.model.patches[self.key][0] = (strength, self.adapter, 1, None, None)
+        with self.load() as (path, _):
+            return Path(path)
+
+    def test_keeps_recent_combinations_and_evicts_least_recently_used(self):
+        paths = {strength: self.use(strength) for strength in (0.1, 0.2, 0.3)}
+        self.assertEqual(len(set(paths.values())), cache.CACHE_SLOTS)
+        self.assertEqual(self.use(0.1), paths[0.1])
+        self.assertEqual(self.builder.call_count, 3)
+        self.use(0.4)
+        self.assertFalse(paths[0.2].exists())
+        self.assertEqual(len(list(cache.CACHE_ROOT.glob("merged-*.safetensors"))), cache.CACHE_SLOTS)
+        for strength in (0.1, 0.3):
+            self.assertEqual(self.use(strength), paths[strength])
+        self.assertEqual(self.builder.call_count, 4)
+        self.use(0.2)
+        self.assertEqual(self.builder.call_count, 5)
+
+    def test_eviction_skips_a_file_still_in_use(self):
+        paths = {strength: self.use(strength) for strength in (0.1, 0.2, 0.3)}
+        unlink = Path.unlink
+
+        def locked(path, *args, **kwargs):
+            if path == paths[0.1]:
+                raise PermissionError("mapped by a kept engine")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", locked):
+            self.use(0.4)
+        self.assertTrue(paths[0.1].exists())
+        self.assertFalse(paths[0.2].exists())
+        self.assertTrue(paths[0.1].with_suffix(".json").exists())
+
+    def test_legacy_single_slot_files_are_removed(self):
+        cache.CACHE_ROOT.mkdir(parents=True)
+        for name in ("merged.safetensors", "manifest.json"):
+            (cache.CACHE_ROOT / name).write_bytes(b"old")
+        self.use(0.1)
+        self.assertFalse((cache.CACHE_ROOT / "merged.safetensors").exists())
+        self.assertFalse((cache.CACHE_ROOT / "manifest.json").exists())
+
     def test_reuse_invalidates_for_strength_adapter_source_and_helper(self):
         original = self.model.patches
         for expected in (1, 1):
@@ -66,7 +112,8 @@ class CacheTests(unittest.TestCase):
                 self.assertEqual(self.builder.call_count, 2)
             with self.load():
                 pass
-        self.assertEqual(self.builder.call_count, 3)
+        # Back to dense rotation: its slot is still cached.
+        self.assertEqual(self.builder.call_count, 2)
 
     def test_keep_plain_lora_and_bypass_unsafe_or_disabled_stacks(self):
         plain = LoRAAdapter(set(), (torch.ones(3, 2), torch.ones(2, 4), None, None, None, None))
@@ -97,7 +144,7 @@ class CacheTests(unittest.TestCase):
                 competing.acquire(timeout=0)
         with competing.acquire(timeout=0):
             pass
-        (cache.CACHE_ROOT / "manifest.json").write_text("invalid", encoding="utf-8")
+        self.manifest().write_text("invalid", encoding="utf-8")
         with self.load():
             pass
         os.utime(path, ns=(Path(path).stat().st_atime_ns, Path(path).stat().st_mtime_ns + 100000))
@@ -129,7 +176,7 @@ class CacheTests(unittest.TestCase):
     def test_failed_build_preserves_previous_cache_and_falls_back(self):
         with self.load():
             pass
-        previous = (cache.CACHE_ROOT / "manifest.json").read_bytes()
+        previous = self.manifest().read_bytes()
         self.model.patches[self.key][0] = (0.9, self.adapter, 1, None, None)
         self.builder.side_effect = RuntimeError("merge failed")
         with self.assertLogs(level="WARNING"):
@@ -138,7 +185,7 @@ class CacheTests(unittest.TestCase):
                 self.assertIs(patches, self.model.patches)
                 with FileLock(str(cache.CACHE_ROOT / "cache.lock")).acquire(timeout=0):
                     pass
-        self.assertEqual((cache.CACHE_ROOT / "manifest.json").read_bytes(), previous)
+        self.assertEqual(self.manifest().read_bytes(), previous)
         self.assertEqual(list(cache.CACHE_ROOT.glob("building-*")), [])
         with FileLock(str(cache.CACHE_ROOT / "cache.lock")).acquire(timeout=0):
             pass
@@ -151,7 +198,7 @@ class CacheTests(unittest.TestCase):
         with self.assertLogs(level="WARNING"):
             with self.load() as (path, _):
                 self.assertEqual(path, str(self.source))
-        self.assertFalse((cache.CACHE_ROOT / "merged.safetensors").exists())
+        self.assertEqual(list(cache.CACHE_ROOT.glob("merged-*")), [])
 
     def test_cancel_propagates_and_releases_lock(self):
         from comfy.model_management import InterruptProcessingException

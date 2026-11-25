@@ -1,4 +1,4 @@
-"""One on-disk merged DiT, using the engine's original CPU merge implementation."""
+"""A few on-disk merged DiTs (least recently used evicted), built with the engine's own merge implementation."""
 from contextlib import ExitStack, contextmanager
 import hashlib
 import json
@@ -22,6 +22,7 @@ from .lora import adapter_tensors, export_loras
 
 CACHE_ROOT = Path(__file__).resolve().parent / "cache" / "lokr"
 HELPER = Path(__file__).resolve().parent / "runtime" / ("moss-lokr-cache.exe" if os.name == "nt" else "moss-lokr-cache")
+CACHE_SLOTS = 3  # each slot is one full DiT on disk (about 5.4 GB for MOSS SFT INT8)
 
 
 def split_patches(patches):
@@ -114,6 +115,30 @@ def build_cache_model(helper, source, output, loras):
                 process.wait()
 
 
+def evict(current):
+    """Leave room for one more slot; a file a kept engine still maps (Windows) is skipped, not forced."""
+    stale = [CACHE_ROOT / "merged.safetensors", CACHE_ROOT / "manifest.json"]  # the old single-slot layout
+    stale += [f for f in CACHE_ROOT.glob("merged-*.safetensors") if f != current and not f.with_suffix(".json").exists()]
+    manifests = sorted((m for m in CACHE_ROOT.glob("merged-*.json") if m != current.with_suffix(".json")),
+                       key=lambda m: m.stat().st_mtime_ns)
+    excess = len(manifests) - (CACHE_SLOTS - 1)
+    for manifest in manifests:
+        if excess <= 0:
+            break
+        try:
+            manifest.with_suffix(".safetensors").unlink(missing_ok=True)
+        except OSError as error:
+            logging.info("MossInfer LoKr cache: keeping %s, still in use (%s)", manifest.stem, error)
+            continue
+        manifest.unlink(missing_ok=True)
+        excess -= 1
+    for path in stale:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            logging.info("MossInfer LoKr cache: could not remove %s (%s)", path.name, error)
+
+
 @contextmanager
 def cached_lokr(model, source, temporary, enabled=True):
     split = split_patches(model.patches) if enabled else None
@@ -145,15 +170,19 @@ def cached_lokr(model, source, temporary, enabled=True):
                     except Timeout:
                         if time.monotonic() >= deadline:
                             raise TimeoutError("另一個 ComfyUI 正在使用 LoKr 快取") from None
-                model_file = CACHE_ROOT / "merged.safetensors"
-                metadata_file = CACHE_ROOT / "manifest.json"
+                slot = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+                model_file = CACHE_ROOT / f"merged-{slot}.safetensors"
+                metadata_file = model_file.with_suffix(".json")
                 try:
                     metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
                     stat = model_file.stat()
                     hit = metadata["key"] == key and stat.st_size == key["size"] and stat.st_mtime_ns == metadata["output_mtime_ns"]
                 except (OSError, ValueError, KeyError, TypeError):
                     hit = False
-                if not hit:
+                if hit:
+                    os.utime(metadata_file)  # least-recently-used order
+                else:
+                    evict(model_file)
                     if shutil.disk_usage(CACHE_ROOT).free < key["size"] + (256 << 20):
                         raise OSError("磁碟空間不足")
                     logging.info("MossInfer LoKr cache MISS: merge once (%d bytes)", key["size"])
@@ -170,7 +199,7 @@ def cached_lokr(model, source, temporary, enabled=True):
                             raise RuntimeError("建立快取時來源模型已變更，或快取不完整")
                         output.replace(model_file)
                         metadata = {"key": key, "output_mtime_ns": model_file.stat().st_mtime_ns}
-                        pending = CACHE_ROOT / "manifest.pending.json"
+                        pending = CACHE_ROOT / f"pending-{slot}.json"
                         pending.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
                         pending.replace(metadata_file)
                     logging.info("MossInfer LoKr cache stored: %.3f s", time.perf_counter() - started)

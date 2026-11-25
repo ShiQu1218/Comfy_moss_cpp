@@ -253,8 +253,6 @@ class MossImageCppSampler(io.ComfyNode):
             loras = export_loras(patches, temporary, model=model)
             logging.info("MossInfer preparation LoRA export: %.3f s (%d files)", time.perf_counter() - started, len(loras))
             started = time.perf_counter()
-            # The LoKr cache rewrites one fixed file; a kept engine would hold stale weights and lock the rebuild.
-            keep_engine = keep_engine if dit_file == path else "off"
             key, session = acquire_session(executable, load, keep_engine)
             logging.info("MossInfer preparation server: %.3f s", time.perf_counter() - started)
             server_reference_support[server_key] = bool(session.reference_latents)
