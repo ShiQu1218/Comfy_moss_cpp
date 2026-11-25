@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import unittest
 import uuid
 import numpy as np
+from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, os.environ["COMFYUI_PATH"])
@@ -118,11 +119,12 @@ class ModularTests(unittest.TestCase):
     def test_component_request_contract(self):
         session = component.ComponentSession.__new__(component.ComponentSession)
         session.process = SimpleNamespace(pid=123)
-        session.call = Mock(side_effect=[{"shm": {"name": "region", "bytes": 20480}}, {"id": 7}])
+        session.call = Mock(side_effect=[{"shm": {"name": "region", "bytes": 20480}}, {"id": 7}, {"freed": True}])
         with patch.object(component, "attach_region", return_value=MagicMock()):
             self.assertEqual(session.import_conditioning(torch.zeros(1, 1, 4096)), 7)
-        self.assertEqual(session.call.call_args.args[1]["shm"], "region")
-        self.assertEqual(session.call.call_args.args[1]["shape"], [1, 4096])
+        imported = session.call.call_args_list[1].args[1]
+        self.assertEqual(imported["shm"], "region")
+        self.assertEqual(imported["shape"], [1, 4096])
         session.import_conditioning = Mock(side_effect=[7, 8])
         session.call = Mock(return_value={"shm": {}, "tensors": {}})
         with patch.object(component, "attach_region", return_value=MagicMock()):
@@ -256,6 +258,124 @@ class ModularTests(unittest.TestCase):
         with patch.object(sampler.comfy.samplers, "calculate_sigmas", return_value=torch.tensor([float("nan"), 0.0])):
             with self.assertRaisesRegex(ValueError, "sigma"):
                 sampler.sampling_sigmas(sampling, "simple", 1, 1)
+
+    def test_finish_frees_run_inputs_and_optionally_releases_vram(self):
+        for release in (False, True):
+            with self.subTest(release=release):
+                session = component.ComponentSession.__new__(component.ComponentSession)
+                session.mapping = Mock()
+                mapping = session.mapping
+                session.conditionings = [7, 8]
+                session.call = Mock(return_value={})
+                session.finish(release)
+                mapping.close.assert_called_once_with()
+                self.assertIsNone(session.mapping)
+                expected = [(("conditioning_free", {"conditionings": [7, 8]}),)]
+                expected += [(("release", {"keep_host_copy": True}),)] if release else []
+                self.assertEqual(session.call.call_args_list, expected)
+
+    def test_import_conditioning_frees_its_scratch_region(self):
+        session = component.ComponentSession.__new__(component.ComponentSession)
+        session.process = SimpleNamespace(pid=123)
+        replies = {"shm_alloc": {"shm": {"name": "r1"}}, "conditioning_import": {"id": 5}, "shm_free": {"freed": True}}
+        session.call = Mock(side_effect=lambda method, params: replies[method])
+        region = type("Region", (bytearray,), {"close": lambda self: None})(4096 + 4 * 4096)
+        with patch.object(component, "attach_region", return_value=region):
+            self.assertEqual(session.import_conditioning(torch.zeros(1, 1, 4096)), 5)
+        self.assertEqual(session.call.call_args_list[-1].args, ("shm_free", {"name": "r1"}))
+
+    def keep_engine_runs(self, modes, fail_at=None, dit_file=None):
+        sampling = Flow(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1.0}))
+        model = SimpleNamespace(patches={}, model_options={}, get_model_object=lambda name: sampling if name == "model_sampling" else Flux2())
+        latent = {"samples": torch.zeros(1, 128, 2, 2)}
+        cond = [[torch.zeros(1, 1, 4096), {}]]
+        sessions = []
+
+        def create(executable, load):
+            session = Mock()
+            session.call.return_value = {"report": {}}
+            session.denoise.side_effect = lambda x, sigma: x * 0.5
+            session.process.poll.return_value = None
+            sessions.append(session)
+            return session
+
+        sampler.cached_engine = None
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / ("moss-server.exe" if os.name == "nt" else "moss-server")
+            executable.touch()
+            with patch.multiple(sampler, model_file=Mock(return_value="base"), bundle_path=Mock(return_value="bundle"),
+                                component_metadata_file=Mock(return_value="component"), executable_path=Mock(return_value=executable),
+                                ComponentSession=Mock(side_effect=create)), \
+                 patch.object(sampler.folder_paths, "get_temp_directory", return_value=directory), \
+                 patch.object(sampler, "cached_lokr", Mock(side_effect=lambda model, path, *args, **kwargs:
+                                                           nullcontext((dit_file or path, {})))):
+                for index, mode in enumerate(modes):
+                    if index == fail_at:
+                        sessions[-1].denoise.side_effect = RuntimeError("boom")
+                        with self.assertRaises(RuntimeError):
+                            sampler.MossImageCppSampler.execute(model, cond, cond, latent, 42, 2, 4, "euler", "simple", 1.0, keep_engine=mode)
+                    else:
+                        sampler.MossImageCppSampler.execute(model, cond, cond, latent, 42, 2, 4, "euler", "simple", 1.0, keep_engine=mode)
+        return sessions
+
+    def test_keep_engine_reuses_one_process_and_frees_each_run(self):
+        sessions = self.keep_engine_runs(["release_vram", "release_vram", "keep_vram"])
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual([c.args for c in sessions[0].finish.call_args_list], [(True,), (True,), (False,)])
+        sessions[0].close.assert_not_called()
+        self.assertIs(sampler.cached_engine[1], sessions[0])
+        sampler.cached_engine = None
+
+    def test_keep_engine_off_closes_cached_and_own_process(self):
+        sessions = self.keep_engine_runs(["release_vram", "off"])
+        self.assertEqual(len(sessions), 2)
+        sessions[0].close.assert_called_once_with()
+        sessions[1].close.assert_called_once_with()
+        sessions[1].finish.assert_not_called()
+        self.assertIsNone(sampler.cached_engine)
+
+    def test_failed_housekeeping_keeps_the_finished_image(self):
+        session = Mock()
+        session.finish.side_effect = RuntimeError("release failed")
+        sampler.cached_engine = None
+        sampler.finish_session("key", session, "release_vram", True)
+        session.close.assert_called_once_with()
+        self.assertIsNone(sampler.cached_engine)
+
+    def test_early_native_fallback_drops_a_kept_engine(self):
+        cached = Mock()
+        sampler.cached_engine = ("key", cached)
+        embeddings = torch.zeros(1, 10, 4096)
+        positive = [[embeddings, {"reference_latents": [torch.zeros(1, 128, 4, 4)]}]]
+        native = ({"samples": torch.ones(1, 128, 4, 4)},)
+        with patch.object(sampler.comfy_nodes, "common_ksampler", return_value=native):
+            sampler.MossImageCppSampler.execute("model", positive, [[embeddings, {}]], {"samples": torch.zeros(1, 128, 4, 4)},
+                                                42, 3, 4, "er_sde", "simple", 1.0)
+        cached.close.assert_called_once_with()
+        self.assertIsNone(sampler.cached_engine)
+
+    def test_keep_engine_skips_the_shared_lokr_cache_file(self):
+        sessions = self.keep_engine_runs(["keep_vram", "keep_vram"], dit_file="merged.safetensors")
+        self.assertEqual(len(sessions), 2)
+        for session in sessions:
+            session.close.assert_called_once_with()
+            session.finish.assert_not_called()
+        self.assertIsNone(sampler.cached_engine)
+
+    def test_session_key_tracks_dit_file_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dit = Path(directory) / "dit.safetensors"
+            dit.write_bytes(b"a")
+            first = sampler.session_key("server", {"dit_file": str(dit)})
+            os.utime(dit, ns=(1, 1))
+            self.assertNotEqual(sampler.session_key("server", {"dit_file": str(dit)}), first)
+
+    def test_keep_engine_drops_process_after_a_failed_run(self):
+        sessions = self.keep_engine_runs(["release_vram", "release_vram", "release_vram"], fail_at=1)
+        self.assertEqual(len(sessions), 2)
+        sessions[0].close.assert_called_once_with()
+        self.assertIs(sampler.cached_engine[1], sessions[1])
+        sampler.cached_engine = None
 
     def test_sampler_runs_native_solvers_and_rejects_nonfinite_output(self):
         sampling = Flow(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1.0}))

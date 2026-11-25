@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 import logging
 import tempfile
@@ -26,6 +27,52 @@ REFERENCE_METHOD = "index_timestep_zero_text_start"
 MAX_REFERENCE_LATENTS = 4
 MAX_REFERENCE_TOKENS = 16384
 CPP_SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep"]
+KEEP_ENGINE = ["off", "release_vram", "keep_vram"]
+# (load key, ComponentSession) kept between runs by keep_engine; ComfyUI runs one prompt at a time.
+cached_engine = None
+
+
+def session_key(executable, load):
+    # Same path with new contents (a replaced model) must not reuse an engine that mapped the old weights.
+    try:
+        stat = os.stat(load["dit_file"])
+        identity = [stat.st_size, stat.st_mtime_ns]
+    except OSError:
+        identity = None
+    return json.dumps([str(executable), load, identity], sort_keys=True)
+
+
+def acquire_session(executable, load, keep_engine):
+    global cached_engine
+    key = session_key(executable, load)
+    if cached_engine is not None:
+        (cached_key, session), cached_engine = cached_engine, None
+        if keep_engine != "off" and cached_key == key and session.alive():
+            return key, session
+        session.close()
+    return key, ComponentSession(executable, load)
+
+
+def finish_session(key, session, keep_engine, succeeded):
+    global cached_engine
+    if keep_engine == "off" or not succeeded:
+        session.close()
+        return
+    try:
+        session.finish(keep_engine == "release_vram")
+    except Exception as error:
+        # The image is already valid; losing the kept engine only costs the next run a reload.
+        logging.warning("MossInfer keep_engine: dropping the engine after a failed cleanup: %s", error)
+        session.close()
+        return
+    cached_engine = (key, session)
+
+
+def drop_cached_session():
+    global cached_engine
+    if cached_engine is not None:
+        cached_engine[1].close()
+        cached_engine = None
 
 
 def model_file(model):
@@ -134,14 +181,18 @@ class MossImageCppSampler(io.ComfyNode):
                                  tooltip="快取最近一組 LoKr 合併結果至磁碟；首次仍需合併，約占一份 DiT 的空間。"),
                 io.Boolean.Input("forecast_denoise", default=False, optional=True, advanced=True,
                                  tooltip="實驗性加速：預測部分去噪速度張量以省略 DiT 推論，可能改變圖片細節。"),
+                io.Combo.Input("keep_engine", options=KEEP_ENGINE, default="off", optional=True, advanced=True,
+                               tooltip="在兩張圖之間保留引擎程序，省去每張重新載入 DiT（輸出位元相同）。"
+                                       "release_vram：每張後釋放 VRAM；keep_vram：DiT 留在 VRAM，最快但 ComfyUI 無法回收這塊記憶體。"),
             ], outputs=[io.Latent.Output()])
 
     @classmethod
     def execute(cls, model, positive, negative, latent_image, seed, steps, cfg, sampler_name, scheduler, denoise,
                 bundle="MOSS-Image-SFT", tier="high", memory_mode="min_memory", cache_lokr=True, forecast_denoise=False,
-                cuda_graphs=False):
+                cuda_graphs=False, keep_engine="off"):
         references = engine_references(positive, negative)
         if references is None:
+            drop_cached_session()  # a kept engine's VRAM would compete with the native model
             return native_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise,
                                  f"reference latents need the same set on every conditioning and method {REFERENCE_METHOD}")
         path = model_file(model)
@@ -157,7 +208,8 @@ class MossImageCppSampler(io.ComfyNode):
             raise ValueError("目前支援 batch 1 的 MOSS-Image LATENT [1,128,h,w]")
         if set(latent_image) - {"samples", "downscale_ratio_spacial", "downscale_ratio_temporal"}:
             raise ValueError("目前不支援 noise mask、batch_index 或額外 latent 設定")
-        if tier not in TIERS or memory_mode not in MODES or sampler_name not in CPP_SAMPLERS or scheduler not in comfy.samplers.KSampler.SCHEDULERS:
+        if (tier not in TIERS or memory_mode not in MODES or sampler_name not in CPP_SAMPLERS
+                or scheduler not in comfy.samplers.KSampler.SCHEDULERS or keep_engine not in KEEP_ENGINE):
             raise ValueError("不支援的引擎、採樣器或排程器設定")
         if not 1 <= steps <= 1000 or not 0 <= denoise <= 1:
             raise ValueError("steps 須介於 1 和 1000，denoise 須介於 0 和 1")
@@ -189,12 +241,15 @@ class MossImageCppSampler(io.ComfyNode):
             loras = export_loras(patches, temporary, model=model)
             logging.info("MossInfer preparation LoRA export: %.3f s (%d files)", time.perf_counter() - started, len(loras))
             started = time.perf_counter()
-            session = ComponentSession(executable, load)
+            # The LoKr cache rewrites one fixed file; a kept engine would hold stale weights and lock the rebuild.
+            keep_engine = keep_engine if dit_file == path else "off"
+            key, session = acquire_session(executable, load, keep_engine)
             logging.info("MossInfer preparation server: %.3f s", time.perf_counter() - started)
             if references and not session.reference_latents:
                 session.close()
                 return native_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
                                      denoise, "this moss-server has no run_begin reference_latents")
+            succeeded = False
             try:
                 logging.info("MossInfer preparing DiT and merging adapters (%d LoRA files)...", len(loras))
                 started = time.perf_counter()
@@ -230,6 +285,7 @@ class MossImageCppSampler(io.ComfyNode):
                 result["samples"] = sampling.inverse_noise_scaling(sigmas[-1].to(device), samples).cpu()
                 if not torch.isfinite(result["samples"]).all():
                     raise RuntimeError("採樣結果含有 NaN 或無限值")
+                succeeded = True
                 return io.NodeOutput(result)
             finally:
-                session.close()
+                finish_session(key, session, keep_engine, succeeded)

@@ -100,9 +100,12 @@ class ComponentSession:
         mapping = attach_region(region, self.process.pid)
         try:
             mapping[4096:4096 + array.nbytes] = array.tobytes()
-            return self.call("conditioning_import", {"shm": region["name"], "dtype": "f32", "shape": list(array.shape)})["id"]
+            conditioning = self.call("conditioning_import", {"shm": region["name"], "dtype": "f32", "shape": list(array.shape)})["id"]
         finally:
             mapping.close()
+        # The import copied the payload; a kept engine would otherwise hit the session's scratch-memory cap.
+        self.call("shm_free", {"name": region["name"]})
+        return conditioning
 
     def import_reference(self, latent):
         # The server copies the latents at run_begin; the region only has to live until then.
@@ -118,6 +121,7 @@ class ComponentSession:
     def begin(self, positive, negative, width, height, sigmas, cfg, loras=None, guidance=None, forecast_denoise=False,
               references=None):
         ids = [self.import_conditioning(c) for c in (positive, negative)]
+        self.conditionings = ids
         self.guidance = guidance or {"simple": None, "post": []}
         self.cfg = cfg
         rows = [{"conditioning": i} for i in ids]
@@ -133,6 +137,9 @@ class ComponentSession:
         # The engine's reference path evaluates at most 2 rows per forward.
         self.rows_per_call = 2 if references else len(rows)
         result = self.call("run_begin", params)
+        # run_begin copied the references; free their scratch regions as the conditioning ones.
+        for reference in params.get("reference_latents", []):
+            self.call("shm_free", {"name": reference["shm"]})
         self.mapping = attach_region(result["shm"], self.process.pid)
         self.offsets = result["tensors"]
         self.forecast_denoise = forecast_denoise and len(sigmas) >= 8
@@ -186,6 +193,17 @@ class ComponentSession:
             velocities = self.exact_velocities(x, value, rows)
         predictions = {row: x - velocity * value for row, velocity in zip(rows, velocities)}
         return combine_predictions(predictions, self.guidance, value, self.cfg)
+
+    def finish(self, release):
+        """After run_end: free this run's inputs so the process can serve another run; optionally free its VRAM."""
+        self.mapping.close()
+        self.mapping = None
+        self.call("conditioning_free", {"conditionings": self.conditionings})
+        if release:
+            self.call("release", {"keep_host_copy": True})
+
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
 
     def close(self):
         if self.process is not None:
