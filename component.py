@@ -15,6 +15,8 @@ import torch
 import comfy.model_management as mm
 from .guidance import prediction_rows, combine_predictions
 
+CALL_IDLE_TIMEOUT = 1800
+
 
 def attach_region(region, pid):
     size = region["bytes"]
@@ -73,7 +75,7 @@ class ComponentSession:
         self.sequence += 1
         self.process.stdin.write((json.dumps({"id": self.sequence, "method": method, "params": params or {}}) + "\n").encode())
         self.process.stdin.flush()
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + CALL_IDLE_TIMEOUT
         while time.monotonic() < deadline:
             mm.throw_exception_if_processing_interrupted()
             try:
@@ -84,6 +86,7 @@ class ComponentSession:
                 self.log.seek(0, os.SEEK_END)
                 self.log.seek(max(0, self.log.tell() - 8192))
                 raise RuntimeError("MossInfer server exited: " + self.log.read().decode("utf-8", errors="replace"))
+            deadline = time.monotonic() + CALL_IDLE_TIMEOUT
             response = json.loads(line)
             if "event" in response:
                 continue

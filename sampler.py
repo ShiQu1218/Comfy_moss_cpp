@@ -30,6 +30,8 @@ CPP_SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", 
 KEEP_ENGINE = ["off", "release_vram", "keep_vram"]
 # (load key, ComponentSession) kept between runs by keep_engine; ComfyUI runs one prompt at a time.
 cached_engine = None
+# (executable path, st_size, st_mtime_ns) -> whether moss-server reports run_reference_latents.
+server_reference_support = {}
 
 
 def session_key(executable, load):
@@ -90,8 +92,8 @@ def model_file(model):
     options = loader_options[0] if loader_options else {}
     if options.get("dtype") is not None or options.get("weight_dtype") is not None or options.get("fp8_optimizations"):
         raise ValueError("C++ 採樣器需要 Load Diffusion Model 的預設 weight_dtype；請使用 default")
-    path = Path(filename).resolve()
-    if not path.is_file() or not any(path.is_relative_to(Path(root).resolve()) for root in folder_paths.get_folder_paths("diffusion_models")):
+    path = Path(os.path.abspath(filename))
+    if not path.is_file() or not any(path.is_relative_to(Path(os.path.abspath(root))) for root in folder_paths.get_folder_paths("diffusion_models")):
         raise ValueError("模型檔案不在 ComfyUI diffusion_models 搜尋目錄內")
     return str(path)
 
@@ -190,6 +192,10 @@ class MossImageCppSampler(io.ComfyNode):
     def execute(cls, model, positive, negative, latent_image, seed, steps, cfg, sampler_name, scheduler, denoise,
                 bundle="MOSS-Image-SFT", tier="high", memory_mode="min_memory", cache_lokr=True, forecast_denoise=False,
                 cuda_graphs=False, keep_engine="off"):
+        if torch.version.hip or not torch.cuda.is_available():
+            drop_cached_session()
+            return native_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image, denoise,
+                                 "needs an NVIDIA CUDA GPU")
         references = engine_references(positive, negative)
         if references is None:
             drop_cached_session()  # a kept engine's VRAM would compete with the native model
@@ -225,6 +231,12 @@ class MossImageCppSampler(io.ComfyNode):
         executable = executable_path().with_name("moss-server.exe" if os.name == "nt" else "moss-server")
         if not executable.is_file():
             raise FileNotFoundError(f"找不到 {executable}")
+        stat = os.stat(executable)
+        server_key = (str(executable), stat.st_size, stat.st_mtime_ns)
+        if references and server_reference_support.get(server_key) is False:
+            drop_cached_session()
+            return native_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,
+                                 denoise, "this moss-server has no run_begin reference_latents")
         progress = comfy.utils.ProgressBar(len(sigmas) - 1)
         progress.update_absolute(0)
         started = time.perf_counter()
@@ -245,6 +257,7 @@ class MossImageCppSampler(io.ComfyNode):
             keep_engine = keep_engine if dit_file == path else "off"
             key, session = acquire_session(executable, load, keep_engine)
             logging.info("MossInfer preparation server: %.3f s", time.perf_counter() - started)
+            server_reference_support[server_key] = bool(session.reference_latents)
             if references and not session.reference_latents:
                 session.close()
                 return native_sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent_image,

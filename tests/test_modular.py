@@ -422,6 +422,120 @@ class ModularTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "size"):
             component.attach_region(region | {"bytes": 1}, pid)
 
+    def test_model_file_allows_linked_file_under_diffusion_models(self):
+        config = SimpleNamespace(unet_config={"image_model": "moss_image"})
+        model = SimpleNamespace(model=SimpleNamespace(model_config=config), object_patches={},
+                                model_options={"transformer_options": {}}, weight_wrapper_patches={})
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "model.safetensors"
+            target.touch()
+            link_dir = Path(root) / "linked"
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(outside, str(link_dir))
+            else:
+                os.symlink(outside, link_dir)
+            try:
+                linked = link_dir / "model.safetensors"
+                model.cached_patcher_init = (sampler.comfy.sd.load_diffusion_model, (str(linked), {}))
+                with patch.object(sampler.folder_paths, "get_folder_paths", return_value=[root]):
+                    self.assertEqual(sampler.model_file(model), os.path.abspath(str(linked)))
+                    escaped = str(Path(root) / ".." / Path(outside).name / "model.safetensors")
+                    model.cached_patcher_init = (sampler.comfy.sd.load_diffusion_model, (escaped, {}))
+                    with self.assertRaisesRegex(ValueError, "diffusion_models"):
+                        sampler.model_file(model)
+            finally:
+                (os.rmdir if os.name == "nt" else os.unlink)(link_dir)
+
+    def test_component_call_extends_idle_deadline_on_events_and_times_out_when_hung(self):
+        self.assertEqual(component.CALL_IDLE_TIMEOUT, 1800)
+        session = component.ComponentSession.__new__(component.ComponentSession)
+        session.process = SimpleNamespace(stdin=Mock())
+        session.sequence = 0
+        now = [0.0]
+        replies = [b'{"event": "progress"}\n', b'{"id": 1, "result": {"ok": true}}\n']
+
+        def next_message(timeout):
+            now[0] += 1200.0
+            if replies:
+                return replies.pop(0)
+            raise component.queue.Empty
+
+        session.messages = SimpleNamespace(get=next_message)
+        with patch.object(component.mm, "throw_exception_if_processing_interrupted"), \
+                patch.object(component.time, "monotonic", side_effect=lambda: now[0]):
+            self.assertEqual(session.call("load"), {"ok": True})
+            with self.assertRaises(TimeoutError):
+                session.call("load")
+
+    def test_missing_reference_capability_is_memoized_until_executable_changes(self):
+        sampling = Flow(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1.0}))
+        model = SimpleNamespace(patches={}, model_options={}, get_model_object=lambda name: sampling if name == "model_sampling" else Flux2())
+        latent = {"samples": torch.zeros(1, 128, 2, 2)}
+        ref = torch.ones(1, 128, 2, 2)
+        cond = [[torch.zeros(1, 1, 4096), {"reference_latents": [ref], "reference_latents_method": sampler.REFERENCE_METHOD}]]
+        native = ({"samples": torch.ones(1, 128, 2, 2)},)
+        old_session = Mock(reference_latents=False)
+        new_session = Mock(reference_latents=True)
+        new_session.call.return_value = {"report": {}}
+        new_session.denoise.side_effect = lambda x, sigma: x * 0.5
+        sampler.cached_engine = None
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(sampler.server_reference_support, {}, clear=True):
+            executable = Path(directory) / ("moss-server.exe" if os.name == "nt" else "moss-server")
+            executable.write_bytes(b"v1")
+            sessions = Mock(side_effect=[old_session, new_session])
+            with patch.multiple(sampler, model_file=Mock(return_value="base"), bundle_path=Mock(return_value="bundle"),
+                                component_metadata_file=Mock(return_value="component"), executable_path=Mock(return_value=executable),
+                                ComponentSession=sessions), \
+                 patch.object(sampler.folder_paths, "get_temp_directory", return_value=directory), \
+                 patch.object(sampler.mm, "unload_all_models") as unload, \
+                 patch.object(sampler.comfy_nodes, "common_ksampler", return_value=native) as common:
+                out1 = sampler.MossImageCppSampler.execute(model, cond, cond, latent, 42, 1, 4, "euler", "simple", 1.0)
+                self.assertIs(out1.result[0], native[0])
+                self.assertEqual(unload.call_count, 1)
+                self.assertEqual(sessions.call_count, 1)
+                old_session.close.assert_called_once_with()
+
+                kept = Mock()
+                sampler.cached_engine = ("key", kept)
+                out2 = sampler.MossImageCppSampler.execute(model, cond, cond, latent, 42, 1, 4, "euler", "simple", 1.0)
+                self.assertIs(out2.result[0], native[0])
+                kept.close.assert_called_once_with()
+                self.assertIsNone(sampler.cached_engine)
+                self.assertEqual(unload.call_count, 1)
+                self.assertEqual(sessions.call_count, 1)
+                self.assertEqual(common.call_count, 2)
+
+                executable.write_bytes(b"v2-updated")
+                out3 = sampler.MossImageCppSampler.execute(model, cond, cond, latent, 42, 1, 4, "euler", "simple", 1.0)
+                self.assertEqual(unload.call_count, 2)
+                self.assertEqual(sessions.call_count, 2)
+                self.assertEqual(common.call_count, 2)
+                self.assertTrue(torch.isfinite(out3.result[0]["samples"]).all())
+
+    def test_non_cuda_or_hip_falls_back_to_native_before_unloading(self):
+        embeddings = torch.zeros(1, 10, 4096)
+        cond = [[embeddings, {}]]
+        latent = {"samples": torch.zeros(1, 128, 4, 4)}
+        native = ({"samples": torch.ones(1, 128, 4, 4)},)
+        for hip, cuda_available in ((None, False), ("6.1", True)):
+            with self.subTest(hip=hip, cuda_available=cuda_available):
+                kept = Mock()
+                sampler.cached_engine = ("key", kept)
+                with patch.object(sampler.torch.version, "hip", hip), \
+                        patch.object(sampler.torch.cuda, "is_available", return_value=cuda_available), \
+                        patch.object(sampler.mm, "unload_all_models") as unload, \
+                        patch.object(sampler, "model_file") as model_file, \
+                        patch.object(sampler.comfy_nodes, "common_ksampler", return_value=native) as common:
+                    output = sampler.MossImageCppSampler.execute("model", cond, cond, latent, 42, 3, 4, "er_sde", "simple", 1.0)
+                common.assert_called_once_with("model", 42, 3, 4, "er_sde", "simple", cond, cond, latent, denoise=1.0)
+                unload.assert_not_called()
+                model_file.assert_not_called()
+                kept.close.assert_called_once_with()
+                self.assertIsNone(sampler.cached_engine)
+                self.assertIs(output.result[0], native[0])
+
 
 if __name__ == "__main__":
     unittest.main(argv=[sys.argv[0]])

@@ -2,6 +2,8 @@
 
 將 [mossimage.cpp / MossInfer](https://github.com/mossimage-cpp/mossimage.cpp) 接到 ComfyUI 的獨立採樣節點。使用 ComfyUI V3 API，沿用既有原生節點與標準 `MODEL`、`CONDITIONING`、`LATENT` 連線。
 
+最低需求：ComfyUI v0.22.0 以上（需要 4 參數的 `comfy.sample.fix_empty_latent_channels`）；已於 v0.45.4 驗證。
+
 ## 速度
 
 ![MOSS C++ 採樣速度比較](docs/speed.png)
