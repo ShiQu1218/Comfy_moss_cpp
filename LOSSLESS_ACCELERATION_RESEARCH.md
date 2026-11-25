@@ -64,7 +64,7 @@
 
 ## 實作與驗收（2026-11-25）
 
-`sampler.py` 新增進階選項 `keep_engine`（`off`／`release_vram`／`keep_vram`，預設 `off`），以 `[executable, load]` 作為快取鍵，最多保留一個程序。每次成功採樣後呼叫 `ComponentSession.finish`，釋放本次的 conditioning；`release_vram` 另外呼叫 `release`。失敗、取消或快取鍵改變時，關閉舊程序。快取鍵包含 DiT 檔的大小與修改時間。使用 LoKr 磁碟快取的圖一律不保留程序，因為 `cache/lokr/merged.safetensors` 是固定路徑，保留會沿用舊權重，Windows 上還會鎖住重建。`import_conditioning` 與 reference latent 在引擎複製資料後立即 `shm_free`，避免常駐程序累積到 scratch 上限。單元測試新增 9 項，`tests/test_modular.py` 共 25 項全數通過。清理失敗時保留已完成的圖，只丟棄引擎；改走原生採樣時先關閉常駐引擎。
+`sampler.py` 新增進階選項 `keep_engine`（`off`／`release_vram`／`keep_vram`，預設 `off`），以 `[executable, load]` 作為快取鍵，最多保留一個程序。每次成功採樣後呼叫 `ComponentSession.finish`，釋放本次的 conditioning；`release_vram` 另外呼叫 `release`。失敗、取消或快取鍵改變時，關閉舊程序。快取鍵包含 DiT 檔的大小與修改時間。LoKr 快取最初是固定路徑，所以當時一律不保留程序；改為多組快取、每組獨立檔名後已取消這項限制（見 [LoRA 載入研究](LORA_SPEED_RESEARCH.md)）。`import_conditioning` 與 reference latent 在引擎複製資料後立即 `shm_free`，避免常駐程序累積到 scratch 上限。單元測試新增 9 項，`tests/test_modular.py` 共 25 項全數通過。清理失敗時保留已完成的圖，只丟棄引擎；改走原生採樣時先關閉常駐引擎。
 
 真實工作流程：`dpmpp_2m` + `beta` + 20 步、1024²、seed 42，依序產生文字、版面、照片、文字共 4 張，五種組合連續執行。腳本見 `test_results/persist/run_keep_engine.py`。
 

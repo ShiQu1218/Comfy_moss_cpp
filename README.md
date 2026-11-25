@@ -109,13 +109,13 @@ VRAM 足夠時，可將獨立採樣器的 `memory_mode` 設為 `balanced`，讓�
 | `release_vram` | 程序保留，DiT 釋放 VRAM，下張重新載入約 0.4 s；仍佔約 0.2 GB | 7.8 s |
 | `keep_vram` | DiT 留在 VRAM：`min_memory` 約 1.6 GB、`balanced` 約 7.1 GB | 7.7 s／6.4 s（balanced） |
 
-`release_vram` 在 RAM 足夠時會把 DiT 副本留在主機 RAM（本機 `balanced` 約 5.4 GB；`min_memory` 因 RAM 不足而未保留）。`keep_vram` 佔用的 VRAM 不受 ComfyUI 管理，同一個 ComfyUI 再載入其他大型模型時可能 OOM。更換 DiT（含同路徑替換檔案）、tier、memory_mode 或 cuda_graphs，或採樣失敗、取消時，會關閉舊程序並重新啟動。使用 LoKr 磁碟快取的那張圖不保留程序：快取固定覆寫同一個檔案，保留會用到舊權重並鎖住重建。數據與驗證見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
+`release_vram` 在 RAM 足夠時會把 DiT 副本留在主機 RAM（本機 `balanced` 約 5.4 GB；`min_memory` 因 RAM 不足而未保留）。`keep_vram` 佔用的 VRAM 不受 ComfyUI 管理，同一個 ComfyUI 再載入其他大型模型時可能 OOM。更換 DiT（含同路徑替換檔案）、tier、memory_mode 或 cuda_graphs，或採樣失敗、取消時，會關閉舊程序並重新啟動。LoKr 磁碟快取的每一組都有獨立檔名，也能使用 `keep_engine`。數據與驗證見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
 
 ### LoKr 載入快取
 
 獨立採樣器預設開啟進階選項 `cache_lokr`。第一次把 LoKr 合併至一份獨立的 DiT 檔；後續相同模型、LoKr 組合及強度直接載入這份檔案，跳過每張圖重做的合併與 INT8 重新量化。更換提示詞、seed、尺寸、步數或 SLG 不需重建。沿用原生或 rgthree Power LoRA Loader 的接法即可，原始模型不會被修改。
 
-快取只保留最近一組，位於本節點的 `cache/lokr/`，占用一份 DiT 的磁碟空間；建立新組合時暫時再需要一份。修改 LoKr 內容／強度、來源模型路徑／大小／修改時間或 helper 版本會重建。不在 RAM／VRAM 常駐合併模型；重啟 ComfyUI 仍可重用磁碟快取。Ampere 及更新的 GPU 會照常即時套用普通 LoRA，包含區塊 side branch，以及與 LoKr 作用於不同權重的文字嵌入、時間調節與輸出層。舊 GPU 上混用一般 LoRA 與 LoKr、其他非線性 adapter 混用、特殊 patch、turbo 或不相容權重會沿用原本載入方式。快取失敗時會警告並退回原流程。
+快取保留最近使用的 3 組（`lokr_cache.py` 的 `CACHE_SLOTS`），位於本節點的 `cache/lokr/`，每組占用一份 DiT 的磁碟空間（MOSS SFT INT8 約 5.4 GB，3 組約 16 GB）；建立新組合時暫時再需要一份。在已快取的組合之間切換不需重建；超過 3 組時刪除最久未用的一組，若該檔仍被常駐引擎使用則改刪下一組。舊版的單一快取檔 `merged.safetensors` 會在第一次建立新快取時移除。修改 LoKr 內容／強度、來源模型路徑／大小／修改時間或 helper 版本會重建。不在 RAM／VRAM 常駐合併模型；重啟 ComfyUI 仍可重用磁碟快取。Ampere 及更新的 GPU 會照常即時套用普通 LoRA，包含區塊 side branch，以及與 LoKr 作用於不同權重的文字嵌入、時間調節與輸出層。舊 GPU 上混用一般 LoRA 與 LoKr、其他非線性 adapter 混用、特殊 patch、turbo 或不相容權重會沿用原本載入方式。快取失敗時會警告並退回原流程。
 
 這份磁碟快取不會在採樣結束時刪除；關閉 `cache_lokr` 也只停止使用快取。需要釋放磁碟空間時，先停止所有正在使用此節點的工作，再刪除 `cache/lokr/`。下次啟用時會重新合併。C++ 引擎程序及其 RAM／VRAM 預設於每次採樣結束後回收（`keep_engine` 開啟時除外）。
 
