@@ -83,6 +83,33 @@ class CacheTests(unittest.TestCase):
         self.assertFalse((cache.CACHE_ROOT / "merged.safetensors").exists())
         self.assertFalse((cache.CACHE_ROOT / "manifest.json").exists())
 
+    def dora_key(self, stacks):
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            return cache.fingerprint(self.source, cache.export_loras(stacks, directory, allow_dora=True), self.helper)
+
+    def test_dora_fingerprint_follows_per_target_order_and_ignores_zero_strength(self):
+        def dora(value):
+            return LoKrAdapter(set(), (torch.full((1, 1), value), torch.ones(3, 4), None, None, None, None, None, None,
+                                       torch.ones(1, 4)))
+        x, y = "diffusion_model.layers.0.proj.o.weight", "diffusion_model.layers.1.proj.o.weight"
+        zero, b, c, d = dora(9.0), dora(2.0), dora(3.0), dora(4.0)
+        off = (0.0, zero, 1, None, None)
+        patch = lambda adapter: (0.5, adapter, 1, None, None)
+        # Previously both exported the same files: [D_y + B_x], [C_x].
+        b_then_c = self.dora_key({y: [off, patch(d)], x: [off, patch(b), patch(c)]})
+        c_then_b = self.dora_key({y: [off, off, off, patch(d)], x: [off, off, patch(c), patch(b)]})
+        self.assertNotEqual(b_then_c, c_then_b)
+        self.assertEqual(b_then_c, self.dora_key({y: [patch(d)], x: [patch(b), patch(c)]}))
+
+    def test_before_build_runs_only_on_a_miss_before_eviction(self):
+        events = []
+        with patch.object(cache, "evict", side_effect=lambda current: events.append("evict")):
+            with cache.cached_lokr(self.model, str(self.source), self.root, before_build=lambda: events.append("drop")):
+                pass
+            with cache.cached_lokr(self.model, str(self.source), self.root, before_build=lambda: events.append("drop")):
+                pass
+        self.assertEqual(events, ["drop", "evict"])
+
     def test_reuse_invalidates_for_strength_adapter_source_and_helper(self):
         original = self.model.patches
         for expected in (1, 1):
@@ -297,6 +324,23 @@ class NativeHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "new file"):
                 cache.build_cache_model(cache.HELPER, source, output, specs)
             self.assertEqual(output.read_bytes(), merged)
+
+    def test_read_only_source_is_merged_into_a_writable_copy(self):
+        key = "diffusion_model.video_embedder.weight"
+        adapter = LoKrAdapter(set(), (torch.ones(32, 8), torch.ones(96, 16), None, None, None, None, None, None, None))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, output = root / "source.safetensors", root / "output.safetensors"
+            save_file({"video_embedder.weight": torch.zeros(3072, 128, dtype=torch.bfloat16)}, str(source))
+            os.chmod(source, 0o444)
+            try:
+                specs = cache.export_loras({key: [(0.5, adapter, 1, None, None)]}, root)
+                cache.build_cache_model(cache.HELPER, source, output, specs)
+                self.assertTrue(torch.all(load_file(str(output))["video_embedder.weight"] == 0.5))
+            finally:
+                for path in (source, output):
+                    if path.exists():
+                        os.chmod(path, 0o666)
 
 
 if __name__ == "__main__":

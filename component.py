@@ -13,7 +13,7 @@ import time
 import numpy as np
 import torch
 import comfy.model_management as mm
-from .guidance import prediction_rows, combine_predictions
+from .guidance import post_rows, prediction_rows, combine_predictions
 
 CALL_IDLE_TIMEOUT = 1800
 
@@ -73,8 +73,11 @@ class ComponentSession:
 
     def call(self, method, params=None):
         self.sequence += 1
-        self.process.stdin.write((json.dumps({"id": self.sequence, "method": method, "params": params or {}}) + "\n").encode())
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write((json.dumps({"id": self.sequence, "method": method, "params": params or {}}) + "\n").encode())
+            self.process.stdin.flush()
+        except OSError:
+            pass  # the server exited (BrokenPipeError, or EINVAL on Windows); stdout EOF below reports its stderr
         deadline = time.monotonic() + CALL_IDLE_TIMEOUT
         while time.monotonic() < deadline:
             mm.throw_exception_if_processing_interrupted()
@@ -130,7 +133,9 @@ class ComponentSession:
         rows = [{"conditioning": i} for i in ids]
         if self.guidance["simple"] is not None:
             rows.append({"conditioning": ids[1], "skip_layers": self.guidance["simple"]["layers"]})
-        rows.extend({"conditioning": ids[0], "skip_layers": spec["layers"]} for spec in self.guidance["post"])
+        # A post spec without valid layers needs no row: its skipped prediction equals cond.
+        rows.extend({"conditioning": ids[0], "skip_layers": spec["layers"]}
+                    for spec, row in zip(self.guidance["post"], post_rows(self.guidance)) if row is not None)
         if len(rows) > 8:
             raise ValueError("跳層引導組合超過引擎的 8 個 prediction rows 上限")
         params = {"width": width, "height": height, "rows": rows, "guidance": "host", "output": "rows",
@@ -148,8 +153,9 @@ class ComponentSession:
         self.forecast_denoise = forecast_denoise and len(sigmas) >= 8
         if self.forecast_denoise:
             self.forecast_tail = float(sigmas[-3])
-            self.forecast_rows = []
-            self.velocity_history = []
+        # Always reset: a kept engine must not carry the previous run's CUDA velocity tensors.
+        self.forecast_rows = []
+        self.velocity_history = []
         self.denoise_calls = 0
         self.forecasted_calls = 0
 
@@ -193,12 +199,14 @@ class ComponentSession:
                 velocities = self.exact_velocities(x, value, rows)
                 self.velocity_history[:] = [*self.velocity_history[-1:], (value, velocities)]
         else:
+            self.velocity_history.clear()  # the exact tail never extrapolates; release the CUDA tensors now
             velocities = self.exact_velocities(x, value, rows)
         predictions = {row: x - velocity * value for row, velocity in zip(rows, velocities)}
         return combine_predictions(predictions, self.guidance, value, self.cfg)
 
     def finish(self, release):
         """After run_end: free this run's inputs so the process can serve another run; optionally free its VRAM."""
+        self.velocity_history = []
         self.mapping.close()
         self.mapping = None
         self.call("conditioning_free", {"conditionings": self.conditionings})
@@ -209,15 +217,21 @@ class ComponentSession:
         return self.process is not None and self.process.poll() is None
 
     def close(self):
-        if self.process is not None:
-            if self.process.poll() is None:
-                self.process.kill()
-            self.process.wait()
-            if hasattr(self, "reader"):
-                self.reader.join(timeout=5)
-            self.process.stdin.close()
-            self.process.stdout.close()
-        if self.mapping is not None:
-            self.mapping.close()
-            self.mapping = None
-        self.log.close()
+        self.velocity_history = []
+        try:
+            if self.process is not None:
+                if self.process.poll() is None:
+                    self.process.kill()
+                self.process.wait()
+                if hasattr(self, "reader"):
+                    self.reader.join(timeout=5)
+                for stream in (self.process.stdin, self.process.stdout):
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass  # a dead server's unflushed stdin bytes fail again here; the handle still closes
+        finally:
+            if self.mapping is not None:
+                self.mapping.close()
+                self.mapping = None
+            self.log.close()

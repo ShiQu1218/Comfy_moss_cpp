@@ -85,7 +85,8 @@ def digest_file(path):
 def fingerprint(source, loras, helper):
     source = Path(source).resolve()
     stat = source.stat()
-    return {"version": 1, "source": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+    # Version 2: exported files keep each target's stack order and skip zero-strength patches.
+    return {"version": 2, "source": str(source), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
             "fast_rotation": "MOSS_LOKR_FAST_ROTATION" in os.environ and "MOSS_LOKR_CPU" not in os.environ,
             "helper": digest_file(helper),
             "loras": [{"sha256": digest_file(spec["path"]), "strength": spec["strength"]} for spec in loras]}
@@ -140,7 +141,8 @@ def evict(current):
 
 
 @contextmanager
-def cached_lokr(model, source, temporary, enabled=True):
+def cached_lokr(model, source, temporary, enabled=True, before_build=None):
+    """before_build runs on a cache miss, before eviction and the GPU merge (e.g. to drop a kept engine)."""
     split = split_patches(model.patches) if enabled else None
     if split is None:
         yield source, model.patches
@@ -182,6 +184,8 @@ def cached_lokr(model, source, temporary, enabled=True):
                 if hit:
                     os.utime(metadata_file)  # least-recently-used order
                 else:
+                    if before_build is not None:
+                        before_build()
                     evict(model_file)
                     if shutil.disk_usage(CACHE_ROOT).free < key["size"] + (256 << 20):
                         raise OSError("磁碟空間不足")

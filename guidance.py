@@ -24,10 +24,13 @@ def native_guidance(options):
         spec = {"layers": sorted({int(layer) for layer in values["single_layers"] if 0 <= int(layer) < 42}),
                 "sigma_start": float(values["sigma_start"]), "sigma_end": float(values["sigma_end"])}
         if kind == "simple":
-            result["simple"] = spec
+            # Without a valid layer the skipped uncond equals the plain uncond.
+            if spec["layers"]:
+                result["simple"] = spec
         else:
             spec.update(scale=float(values["scale"]), rescaling_scale=float(values["rescaling_scale"]))
-            result["post"].append(spec)
+            if spec["scale"] > 0:  # native skips the whole callback body otherwise
+                result["post"].append(spec)
     return result
 
 
@@ -35,11 +38,21 @@ def active(spec, sigma):
     return spec is not None and spec["sigma_end"] <= sigma <= spec["sigma_start"]
 
 
+def post_rows(guidance):
+    """The prediction row of each post spec, or None for one without valid layers (its prediction is cond)."""
+    row = 3 if guidance["simple"] is not None else 2
+    rows = []
+    for spec in guidance["post"]:
+        rows.append(row if spec["layers"] else None)
+        row += bool(spec["layers"])
+    return rows
+
+
 def prediction_rows(guidance, sigma, cfg):
     negative = 2 if active(guidance["simple"], sigma) else 1
     rows = [0] + ([negative] if cfg != 1 else [])
-    offset = 3 if guidance["simple"] is not None else 2
-    rows += [offset + i for i, spec in enumerate(guidance["post"]) if spec["scale"] > 0 and active(spec, sigma)]
+    rows += [row for row, spec in zip(post_rows(guidance), guidance["post"])
+             if row is not None and spec["scale"] > 0 and active(spec, sigma)]
     return rows
 
 
@@ -47,10 +60,11 @@ def combine_predictions(predictions, guidance, sigma, cfg):
     cond = predictions[0]
     negative = 2 if active(guidance["simple"], sigma) else 1
     result = cond if cfg == 1 else predictions[negative] + (cond - predictions[negative]) * cfg
-    offset = 3 if guidance["simple"] is not None else 2
-    for i, spec in enumerate(guidance["post"]):
+    for row, spec in zip(post_rows(guidance), guidance["post"]):
         if spec["scale"] > 0 and active(spec, sigma):
-            result = result + (cond - predictions[offset + i]) * spec["scale"]
+            if row is not None:
+                result = result + (cond - predictions[row]) * spec["scale"]
             if spec["rescaling_scale"] != 0:
-                result *= spec["rescaling_scale"] * (cond.std() / result.std()) + (1 - spec["rescaling_scale"])
+                # Not in place: result may still be cond itself.
+                result = result * (spec["rescaling_scale"] * (cond.std() / result.std()) + (1 - spec["rescaling_scale"]))
     return result

@@ -19,6 +19,8 @@ TIERS = ["high", "reference", "turbo"]
 MODES = ["min_memory", "balanced", "max_speed"]
 SAMPLERS = ["euler", "ab2", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep"]
 SCHEDULERS = ["moss", "simple", "normal", "karras", "exponential", "beta", "sgm_uniform"]
+# sampler.py registers its kept-engine release here; it imports this module, not the reverse.
+KEPT_ENGINE_RELEASERS = []
 
 
 def bundle_path(name):
@@ -91,6 +93,8 @@ class MossImageCpp(io.ComfyNode):
         components = [folder_paths.get_full_path_or_raise(kind, name) for kind, name in (
             ("diffusion_models", dit), ("text_encoders", text_encoder), ("vae", vae))]
         model_management.throw_exception_if_processing_interrupted()
+        for release in KEPT_ENGINE_RELEASERS:
+            release()  # a kept sampler engine's VRAM is invisible to unload_all_models
         model_management.unload_all_models()
         model_management.soft_empty_cache()
         # shortcut: 每次重新載入模型；需要連續大量生成時再改用常駐 moss-server。

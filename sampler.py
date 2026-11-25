@@ -17,7 +17,7 @@ import nodes as comfy_nodes
 from comfy_api.latest import io
 
 from .component import ComponentSession
-from .nodes import BUNDLE_ROOT, TIERS, MODES, bundle_path, executable_path
+from .nodes import BUNDLE_ROOT, KEPT_ENGINE_RELEASERS, TIERS, MODES, bundle_path, executable_path
 from .lora import export_loras
 from .guidance import native_guidance
 from .lokr_cache import cached_lokr
@@ -26,6 +26,9 @@ from .lokr_cache import cached_lokr
 REFERENCE_METHOD = "index_timestep_zero_text_start"
 MAX_REFERENCE_LATENTS = 4
 MAX_REFERENCE_TOKENS = 16384
+MAX_REFERENCE_SIDE = 1024
+# int(steps / denoise) schedule length; steps=1000 at the UI's smallest denoise step (0.01) fits.
+MAX_SCHEDULE_STEPS = 100000
 CPP_SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep"]
 KEEP_ENGINE = ["off", "release_vram", "keep_vram"]
 # (load key, ComponentSession) kept between runs by keep_engine; ComfyUI runs one prompt at a time.
@@ -77,6 +80,9 @@ def drop_cached_session():
         cached_engine = None
 
 
+KEPT_ENGINE_RELEASERS.append(drop_cached_session)
+
+
 def model_file(model):
     if model.model.model_config.unet_config.get("image_model") != "moss_image":
         raise ValueError("此節點只支援 MOSS-Image MODEL")
@@ -120,13 +126,20 @@ def engine_references(positive, negative):
         return []
     references = found[0]
     # The engine gives every row the same references; ComfyUI gives each conditioning its own.
-    same = all(len(other) == len(references) and all(a is b or (a.shape == b.shape and torch.equal(a, b))
-                                                    for a, b in zip(other, references)) for other in found[1:])
+    # torch.equal raises across devices; compare on the CPU.
+    same = all(len(other) == len(references) and all(
+        a is b or (a.shape == b.shape and a.dtype == b.dtype and torch.equal(a.detach().cpu(), b.detach().cpu()))
+        for a, b in zip(other, references)) for other in found[1:])
     if not same or any(entry.get("reference_latents_method") != REFERENCE_METHOD for entry in metadata):
         return None
     if len(references) > MAX_REFERENCE_LATENTS or any(latent.ndim != 4 or latent.shape[:2] != (1, 128) for latent in references):
         return None
+    # moss-server's run_begin limits: each side 1..1024 latent cells and finite values.
+    if any(not 1 <= side <= MAX_REFERENCE_SIDE for latent in references for side in latent.shape[-2:]):
+        return None
     if sum(latent.shape[-2] * latent.shape[-1] for latent in references) > MAX_REFERENCE_TOKENS:
+        return None
+    if not all(torch.isfinite(latent).all() for latent in references):
         return None
     return references
 
@@ -146,8 +159,13 @@ def component_metadata_file(kind, prefix):
 
 
 def sampling_sigmas(sampling, scheduler, steps, denoise):
+    if denoise < 1 and steps / denoise > MAX_SCHEDULE_STEPS:
+        raise ValueError(f"denoise is too small: steps / denoise must not exceed {MAX_SCHEDULE_STEPS}")
     count = int(steps / denoise) if denoise < 1 else steps
     if scheduler == "kl_optimal" and count == 1:
+        # ComfyUI's kl_optimal divides by n - 1 and yields NaN for one step; only a full denoise has a clear answer.
+        if denoise < 1:
+            raise ValueError("kl_optimal with steps=1 needs denoise=1 or denoise <= 0.5")
         return torch.tensor([float(sampling.sigma_max), 0.0], dtype=torch.float32)
     sigmas = comfy.samplers.calculate_sigmas(sampling, scheduler, count)[-(steps + 1):]
     if not torch.isfinite(sigmas).all() or (sigmas < 0).any() or (sigmas[1:] > sigmas[:-1]).any():
@@ -244,10 +262,15 @@ class MossImageCppSampler(io.ComfyNode):
         mm.soft_empty_cache()
         logging.info("MossInfer preparation unload: %.3f s", time.perf_counter() - started)
         device = mm.get_torch_device()
-        noise = comfy.sample.prepare_noise(latent, seed).to(device)
-        x = sampling.noise_scaling(sigmas[0].to(device), noise, latent.to(device), bool(sigmas[0] >= sampling.sigma_max))
+        # As native ComfyUI: noise drawn at the latent's dtype, then both cast to float32 before noise_scaling.
+        noise = comfy.sample.prepare_noise(latent, seed).to(device=device, dtype=torch.float32)
+        x = sampling.noise_scaling(sigmas[0].to(device), noise, latent.to(device=device, dtype=torch.float32),
+                                   bool(sigmas[0] >= sampling.sigma_max))
+        if keep_engine == "off":
+            drop_cached_session()  # release its unmanaged VRAM before the LoKr merge and LoRA export
         with tempfile.TemporaryDirectory(prefix="moss-lora-", dir=folder_paths.get_temp_directory()) as temporary, \
-                cached_lokr(model, path, temporary, enabled=cache_lokr and tier != "turbo") as (dit_file, patches):
+                cached_lokr(model, path, temporary, enabled=cache_lokr and tier != "turbo",
+                            before_build=drop_cached_session) as (dit_file, patches):
             load["dit_file"] = dit_file
             started = time.perf_counter()
             loras = export_loras(patches, temporary, model=model)

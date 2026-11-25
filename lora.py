@@ -77,7 +77,7 @@ def full_delta(model, key, stack, device="cpu"):
 
 
 def export_loras(patches, directory, model=None, allow_dora=False, device="cpu"):
-    groups = {}
+    groups = []  # ordered [((index, strength), tensors)]
     result = []
     merged = {}
     merged_bytes = 0
@@ -94,7 +94,8 @@ def export_loras(patches, directory, model=None, allow_dora=False, device="cpu")
             raise ValueError(f"不支援的 LoRA 目標：{key}")
         pending = []
         materialize = False
-        for index, (strength, adapter, strength_model, offset, function) in enumerate(stack):
+        index = 0  # counts only applied patches, so a zero-strength partial LoRA cannot shift grouping
+        for strength, adapter, strength_model, offset, function in stack:
             if strength_model != 1.0 or function is not None or not math.isfinite(strength):
                 raise ValueError(f"無法轉送此 MODEL patch 的縮放或轉換：{key}")
             if strength == 0:
@@ -110,7 +111,8 @@ def export_loras(patches, directory, model=None, allow_dora=False, device="cpu")
             stem, kind = target.rsplit(".", 1)
             tensors = adapter_tensors(stem, kind, adapter, allow_dora=allow_dora)
             materialize |= tensors is None
-            pending.append((index, float(strength), tensors))
+            pending.append((target, index, float(strength), tensors))
+            index += 1
         if materialize:
             stem, kind = key.rsplit(".", 1)
             delta = full_delta(model, key, stack, device=device)
@@ -123,13 +125,18 @@ def export_loras(patches, directory, model=None, allow_dora=False, device="cpu")
             merged_bytes += size
             logging.info("MossInfer materialized native adapter stack: %s (%d bytes)", key, delta.numel() * delta.element_size())
             continue
-        for index, strength, tensors in pending:
-            group = groups.setdefault((index, float(strength)), {})
-            if group.keys() & tensors.keys():
-                raise ValueError(f"重複的 LoRA 目標：{target}")
-            group.update(tensors)
+        last = {}  # target -> position of the group holding its previous patch
+        for target, index, strength, tensors in pending:
+            # A target's next patch must land in a later file than its previous one: files apply in order.
+            position = next((i for i in range(last.get(target, -1) + 1, len(groups))
+                             if groups[i][0] == (index, strength) and not groups[i][1].keys() & tensors.keys()), None)
+            if position is None:
+                position = len(groups)
+                groups.append(((index, strength), {}))
+            groups[position][1].update(tensors)
+            last[target] = position
     flush_merged()
-    for (index, strength), tensors in groups.items():
+    for (index, strength), tensors in groups:
         path = Path(directory) / f"lora_{len(result)}.safetensors"
         # Clones prevent shared QKV factors from becoming aliased safetensors entries.
         tensors = {key: value.detach().to("cpu").contiguous().clone() for key, value in tensors.items()}

@@ -144,6 +144,38 @@ class LoraTests(unittest.TestCase):
         self.assertTrue(torch.all(down == 1))
         self.assertEqual(len(patches), 3)
 
+    def test_files_keep_each_targets_stack_order_across_parameters(self):
+        # qkv creates groups (0, 1.0) and (1, 0.5) first; o's second patch must not join the earlier (1, 0.5) file.
+        qkv = "diffusion_model.layers.0.proj.qkv.weight"
+        o = "diffusion_model.layers.0.proj.o.weight"
+        slice_adapter = LoRAAdapter(set(), (torch.ones(3072, 2), torch.ones(2, 3), None, None, None, None))
+        first = LoRAAdapter(set(), (torch.full((3, 2), 1.0), torch.ones(2, 4), None, None, None, None))
+        second = LoRAAdapter(set(), (torch.full((3, 2), 2.0), torch.ones(2, 4), None, None, None, None))
+        patches = {qkv: [(1.0, slice_adapter, 1, (0, 0, 3072), None), (0.5, slice_adapter, 1, (0, 3072, 3072), None)],
+                   o: [(0.5, first, 1, None, None), (0.5, second, 1, None, None)]}
+        with tempfile.TemporaryDirectory() as temporary:
+            specs = export_loras(patches, temporary)
+            order = []
+            for spec in specs:
+                tensors = comfy.utils.load_torch_file(spec["path"], safe_load=True)
+                up = tensors.get("diffusion_model.layers.0.proj.o.lora_up.weight")
+                if up is not None:
+                    order.append(float(up[0, 0]))
+        self.assertEqual(order, [1.0, 2.0])
+
+    def test_zero_strength_partial_lora_does_not_split_files(self):
+        adapter = LoRAAdapter(set(), (torch.ones(3, 2), torch.ones(2, 4), None, None, None, None))
+        unused = LoRAAdapter(set(), (torch.zeros(3, 2), torch.zeros(2, 4), None, None, None, None))
+        patches = {"diffusion_model.layers.0.proj.o.weight": [(0.0, unused, 1, None, None), (0.7, adapter, 1, None, None)],
+                   "diffusion_model.layers.1.proj.o.weight": [(0.7, adapter, 1, None, None)]}
+        with tempfile.TemporaryDirectory() as temporary:
+            specs = export_loras(patches, temporary)
+            self.assertEqual(len(specs), 1)
+            self.assertEqual(len(comfy.utils.load_torch_file(specs[0]["path"], safe_load=True)), 6)
+            # Zero-strength entries are skipped but still validated.
+            with self.assertRaises(ValueError):
+                export_loras({"diffusion_model.layers.0.proj.o.weight": [(0.0, unused, 0.5, None, None)]}, temporary)
+
     def test_unsupported_patches_fail(self):
         key = "diffusion_model.layers.0.proj.o.weight"
         adapter = LoRAAdapter(set(), (torch.ones(3, 2), torch.ones(2, 4), None, None, None, None))

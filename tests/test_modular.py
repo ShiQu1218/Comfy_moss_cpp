@@ -64,6 +64,7 @@ class ModularTests(unittest.TestCase):
         session.cfg = 4
         session.guidance = {"simple": {"layers": [22], "sigma_start": 0.8, "sigma_end": 0.2}, "post": []}
         session.forecast_denoise = False
+        session.velocity_history = []
         session.denoise_calls = 0
         for index, offset in enumerate(session.offsets["out"]):
             session.mapping[offset:offset + 512] = np.full(128, index + 1, dtype=np.float32).tobytes()
@@ -193,6 +194,25 @@ class ModularTests(unittest.TestCase):
                  conditioning(reference_latents=[torch.ones(1, 128, 128, 129)], reference_latents_method=method))]:
             self.assertIsNone(sampler.engine_references(positive, negative))
 
+    def test_engine_references_respect_server_side_and_finiteness_limits(self):
+        def cond(latent):
+            return [[torch.zeros(1, 1, 4096), {"reference_latents": [latent], "reference_latents_method": sampler.REFERENCE_METHOD}]]
+        valid = torch.ones(1, 128, 8, 1024)
+        self.assertEqual(len(sampler.engine_references(cond(valid), cond(valid.clone()))), 1)
+        for latent in (torch.ones(1, 128, 8, 1025), torch.ones(1, 128, 1025, 8), torch.ones(1, 128, 0, 8),
+                       torch.full((1, 128, 2, 2), float("nan")), torch.full((1, 128, 2, 2), float("inf"))):
+            with self.subTest(shape=tuple(latent.shape)):
+                self.assertIsNone(sampler.engine_references(cond(latent), cond(latent)))
+        self.assertIsNone(sampler.engine_references(cond(valid), cond(valid.to(torch.float16))))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_engine_references_compare_across_devices(self):
+        def cond(latent):
+            return [[torch.zeros(1, 1, 4096), {"reference_latents": [latent], "reference_latents_method": sampler.REFERENCE_METHOD}]]
+        latent = torch.ones(1, 128, 2, 2)
+        self.assertEqual(len(sampler.engine_references(cond(latent), cond(latent.cuda()))), 1)
+        self.assertIsNone(sampler.engine_references(cond(latent), cond(latent.cuda() * 2)))
+
     def test_reference_runs_split_rows_into_pairs(self):
         session = component.ComponentSession.__new__(component.ComponentSession)
         x = torch.zeros(1, 128, 2, 2)
@@ -255,6 +275,18 @@ class ModularTests(unittest.TestCase):
         self.assertEqual(len(sigmas), 11)
         self.assertTrue((sigmas[1:] < sigmas[:-1]).all())
         self.assertEqual(sampler.sampling_sigmas(sampling, "kl_optimal", 1, 1).tolist(), [1.0, 0.0])
+        # One kl_optimal step at 0.5 < denoise < 1 would otherwise run as a full denoise.
+        with self.assertRaisesRegex(ValueError, "kl_optimal"):
+            sampler.sampling_sigmas(sampling, "kl_optimal", 1, 0.6)
+        partial = sampler.sampling_sigmas(sampling, "kl_optimal", 1, 0.5)
+        self.assertEqual(len(partial), 2)
+        self.assertLess(float(partial[0]), float(sampling.sigma_max))
+        # An unbounded int(steps / denoise) schedule is rejected before allocating it.
+        with patch.object(sampler.comfy.samplers, "calculate_sigmas") as calculate:
+            with self.assertRaisesRegex(ValueError, "denoise"):
+                sampler.sampling_sigmas(sampling, "simple", 1000, 1e-6)
+            calculate.assert_not_called()
+        self.assertGreaterEqual(len(sampler.sampling_sigmas(sampling, "simple", 1000, 0.01)), 2)
         with patch.object(sampler.comfy.samplers, "calculate_sigmas", return_value=torch.tensor([float("nan"), 0.0])):
             with self.assertRaisesRegex(ValueError, "sigma"):
                 sampler.sampling_sigmas(sampling, "simple", 1, 1)
@@ -284,10 +316,10 @@ class ModularTests(unittest.TestCase):
             self.assertEqual(session.import_conditioning(torch.zeros(1, 1, 4096)), 5)
         self.assertEqual(session.call.call_args_list[-1].args, ("shm_free", {"name": "r1"}))
 
-    def keep_engine_runs(self, modes, fail_at=None, dit_file=None):
+    def keep_engine_runs(self, modes, fail_at=None, dit_file=None, kept=None, lokr=None, latent=None):
         sampling = Flow(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1.0}))
         model = SimpleNamespace(patches={}, model_options={}, get_model_object=lambda name: sampling if name == "model_sampling" else Flux2())
-        latent = {"samples": torch.zeros(1, 128, 2, 2)}
+        latent = latent or {"samples": torch.zeros(1, 128, 2, 2)}
         cond = [[torch.zeros(1, 1, 4096), {}]]
         sessions = []
 
@@ -299,7 +331,8 @@ class ModularTests(unittest.TestCase):
             sessions.append(session)
             return session
 
-        sampler.cached_engine = None
+        sampler.cached_engine = kept
+        lokr = lokr or (lambda model, path, *args, **kwargs: nullcontext((dit_file or path, {})))
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / ("moss-server.exe" if os.name == "nt" else "moss-server")
             executable.touch()
@@ -307,8 +340,7 @@ class ModularTests(unittest.TestCase):
                                 component_metadata_file=Mock(return_value="component"), executable_path=Mock(return_value=executable),
                                 ComponentSession=Mock(side_effect=create)), \
                  patch.object(sampler.folder_paths, "get_temp_directory", return_value=directory), \
-                 patch.object(sampler, "cached_lokr", Mock(side_effect=lambda model, path, *args, **kwargs:
-                                                           nullcontext((dit_file or path, {})))):
+                 patch.object(sampler, "cached_lokr", Mock(side_effect=lokr)):
                 for index, mode in enumerate(modes):
                     if index == fail_at:
                         sessions[-1].denoise.side_effect = RuntimeError("boom")
@@ -333,6 +365,111 @@ class ModularTests(unittest.TestCase):
         sessions[1].close.assert_called_once_with()
         sessions[1].finish.assert_not_called()
         self.assertIsNone(sampler.cached_engine)
+
+    def test_keep_engine_off_drops_a_kept_engine_before_lokr_cache_and_export(self):
+        kept = Mock()
+        seen = {}
+
+        def lokr(model, path, *args, before_build=None, **kwargs):
+            seen["closed"] = kept.close.called and sampler.cached_engine is None
+            seen["before_build"] = before_build
+            return nullcontext((path, {}))
+
+        self.keep_engine_runs(["off"], kept=("old", kept), lokr=lokr)
+        self.assertTrue(seen["closed"])
+        self.assertIs(seen["before_build"], sampler.drop_cached_session)
+
+    def test_lokr_cache_miss_drops_a_kept_engine_before_building(self):
+        kept = Mock()
+
+        def lokr(model, path, *args, before_build=None, **kwargs):
+            self.assertFalse(kept.close.called)  # keep_vram keeps it until the cache knows it misses
+            before_build()
+            kept.close.assert_called_once_with()
+            return nullcontext(("merged-new.safetensors", {}))
+
+        sessions = self.keep_engine_runs(["keep_vram"], kept=("old", kept), lokr=lokr)
+        self.assertEqual(len(sessions), 1)
+        self.assertIs(sampler.cached_engine[1], sessions[0])
+        sampler.cached_engine = None
+
+    def test_half_precision_latent_is_sampled_in_float32_as_native(self):
+        samples = (torch.randn(1, 128, 2, 2, generator=torch.Generator().manual_seed(3)) * 0.1).to(torch.bfloat16)
+        latent = {"samples": samples}
+        sessions = self.keep_engine_runs(["off"], latent=latent)
+        x = sessions[0].denoise.call_args_list[0].args[0]
+        sampling = Flow(SimpleNamespace(sampling_settings={"shift": 5.0, "multiplier": 1.0}))
+        sigmas = sampler.sampling_sigmas(sampling, "simple", 2, 1.0)
+        noise = sampler.comfy.sample.prepare_noise(samples, 42).to(torch.float32)
+        expected = sampling.noise_scaling(sigmas[0], noise, samples.to(torch.float32), bool(sigmas[0] >= sampling.sigma_max))
+        self.assertEqual(x.dtype, torch.float32)
+        torch.testing.assert_close(x.cpu(), expected, rtol=0, atol=0)
+        self.assertEqual(latent["samples"].dtype, torch.bfloat16)
+        self.assertIs(latent["samples"], samples)
+
+    def test_dead_server_reports_stderr_and_close_releases_everything(self):
+        session = component.ComponentSession.__new__(component.ComponentSession)
+        session.process = Mock(pid=123)
+        session.process.poll.return_value = 1
+        session.process.stdin.write.side_effect = OSError(22, "Invalid argument")
+        session.process.stdin.close.side_effect = OSError(22, "Invalid argument")
+        session.sequence = 0
+        session.messages = component.queue.Queue()
+        session.messages.put(None)
+        session.log = tempfile.TemporaryFile()
+        session.log.write(b"CUDA out of memory")
+        session.mapping = Mock()
+        mapping, log = session.mapping, session.log
+        with patch.object(component.mm, "throw_exception_if_processing_interrupted"):
+            with self.assertRaisesRegex(RuntimeError, "exited: CUDA out of memory"):
+                session.call("run_begin", {})
+        session.process.stdin.flush.side_effect = BrokenPipeError
+        session.process.stdin.write.side_effect = None
+        session.messages.put(None)
+        with patch.object(component.mm, "throw_exception_if_processing_interrupted"):
+            with self.assertRaisesRegex(RuntimeError, "exited"):
+                session.call("run_begin", {})
+        session.close()
+        session.process.stdout.close.assert_called_once_with()
+        mapping.close.assert_called_once_with()
+        self.assertIsNone(session.mapping)
+        self.assertTrue(log.closed)
+
+    def test_velocity_history_is_released_in_the_tail_finish_and_next_begin(self):
+        sigmas = torch.linspace(1, 0, 11)
+        x = torch.zeros(1, 128, 1, 1)
+        session = component.ComponentSession.__new__(component.ComponentSession)
+        session.process = SimpleNamespace(pid=123)
+        session.import_conditioning = Mock(side_effect=[7, 8, 9, 10])
+        session.call = Mock(return_value={"shm": {}, "tensors": {}})
+        session.exact_velocities = Mock(side_effect=lambda x, sigma, rows: [torch.full_like(x, sigma) for row in rows])
+        with patch.object(component, "attach_region"):
+            session.begin(None, None, 16, 16, sigmas, 2, forecast_denoise=True)
+            for sigma in sigmas[:-4]:  # ends right after an exact step, so two velocities are held
+                session.denoise(x, sigma[None])
+            self.assertEqual(len(session.velocity_history), 2)
+            session.denoise(x, sigmas[-3][None])  # a tail step
+            self.assertEqual(session.velocity_history, [])
+            session.velocity_history = [(0.5, [x])]
+            session.finish(False)
+            self.assertEqual(session.velocity_history, [])
+            session.velocity_history = [(0.5, [x])]
+            session.begin(None, None, 16, 16, sigmas, 2, forecast_denoise=False)
+        self.assertEqual(session.velocity_history, [])
+        self.assertEqual(session.forecast_rows, [])
+
+    def test_post_slg_without_valid_layers_takes_no_engine_row(self):
+        session = component.ComponentSession.__new__(component.ComponentSession)
+        session.process = SimpleNamespace(pid=123)
+        session.import_conditioning = Mock(side_effect=[7, 8])
+        session.call = Mock(return_value={"shm": {}, "tensors": {}})
+        empty = {"layers": [], "sigma_start": 1.0, "sigma_end": 0.0, "scale": 2.0, "rescaling_scale": 0.5}
+        guidance = {"simple": None, "post": [empty, empty | {"layers": [22]}]}
+        with patch.object(component, "attach_region"):
+            session.begin(None, None, 16, 16, torch.tensor([1.0, 0.0]), 4, guidance=guidance)
+        rows = session.call.call_args.args[1]["rows"]
+        self.assertEqual(rows, [{"conditioning": 7}, {"conditioning": 8}, {"conditioning": 7, "skip_layers": [22]}])
+        self.assertEqual(component.prediction_rows(guidance, 0.5, 4), [0, 1, 2])
 
     def test_failed_housekeeping_keeps_the_finished_image(self):
         session = Mock()

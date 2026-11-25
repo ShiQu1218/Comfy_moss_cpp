@@ -52,6 +52,8 @@ int main(int argc, char** argv) {
       if (adapter.kind != mi::lora::AdapterKind::kLoKr && adapter.kind != mi::lora::AdapterKind::kFull)
         throw std::runtime_error("only LoKr or materialized adapters can be baked by this helper");
     fs::copy_file(source, output);
+    // copy_file keeps a read-only source's attributes; the copy must be writable to merge in place.
+    fs::permissions(output, fs::perms::owner_write, fs::perm_options::add);
     std::fstream file(output, std::ios::binary | std::ios::in | std::ios::out);
     if (!file) throw std::runtime_error("cache output could not be opened");
     for (const auto& module : stack.merge_modules()) {

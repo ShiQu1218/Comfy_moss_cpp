@@ -64,6 +64,16 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(float(image[0, 0, 0, 0]), 1.0)
         self.assertFalse(list(self.root.glob("mossimage-*")))
 
+    def test_kept_sampler_engine_is_released_before_unloading_and_launch(self):
+        events = []
+        release = Mock(side_effect=lambda: events.append("release"))
+        nodes.model_management.unload_all_models.side_effect = lambda: events.append("unload")
+        launch = Mock(side_effect=lambda *args, **kwargs: events.append("launch") or Mock(returncode=1, poll=Mock(return_value=1)))
+        with patch.object(nodes, "KEPT_ENGINE_RELEASERS", [release]), patch.object(nodes.subprocess, "Popen", launch):
+            with self.assertRaises(RuntimeError):
+                nodes.MossImageCpp.execute(**self.args)
+        self.assertEqual(events, ["release", "unload", "launch"])
+
     def test_engine_error(self):
         def launch(command, **kwargs):
             kwargs["stderr"].write(b"model rejected")
