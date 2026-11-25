@@ -1,7 +1,7 @@
-"""Render docs/speed.png: per-image sampling time for the measured MOSS C++ settings.
+"""Render docs/speed.png: Native ComfyUI KSampler vs MOSS C++ under identical settings.
 
-Numbers: RTX 5080, 1024x1024, CFG 4, measured from the sampler node start to VAE Decode start; see
-MATH_ACCELERATION_RESEARCH.md (solver/step sweep) and LOSSLESS_ACCELERATION_RESEARCH.md (keep_engine, 2nd image on).
+Numbers: RTX 5080 16 GB, 1024x1024, euler / simple / 50 steps / CFG 3, INT8 ConvRot SFT,
+measured from the sampler node start to VAE Decode start (see test_results/speed_chart/results.json).
 """
 from pathlib import Path
 
@@ -11,46 +11,80 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
-BASELINE, CHANGES, LOSSLESS = "#8c8c8c", "#f47230", "#257de0"
+NATIVE, CPP, FORECAST = "#8c8c8c", "#257de0", "#f47230"
 TEXT, MUTED, GRID = "#191919", "#666666", "#e6e6e6"
-# (label, seconds, color)
-ROWS = [
-    ("ER-SDE · simple · 50 步（預設）", 22.35, BASELINE),
-    ("dpmpp_2m · beta · 20 步", 10.37, CHANGES),
-    ("　＋ keep_engine = release_vram", 7.84, LOSSLESS),
-    ("　＋ keep_engine = keep_vram", 7.66, LOSSLESS),
-    ("　＋ keep_vram ＋ balanced", 6.41, LOSSLESS),
-    ("dpmpp_2m · beta · 12 步", 6.91, CHANGES),
-    ("dpmpp_2m · beta · 10 步", 6.21, CHANGES),
+
+# (label, seconds, color, speedup_baseline_seconds or None)
+NO_LORA_ROWS = [
+    ("官方 KSampler（首次載入）", 88.982, NATIVE, None),
+    ("官方 KSampler（已載入模型）", 84.236, NATIVE, None),
+    ("MOSS C++（預設 min_memory）", 21.914, CPP, 84.236),
+    ("MOSS C++（預設 ＋ 噪聲預測）", 16.024, FORECAST, 84.236),
+    ("MOSS C++（keep_vram ＋ balanced）", 15.711, CPP, 84.236),
+    ("MOSS C++（keep_vram ＋ balanced ＋ 噪聲預測）", 11.018, FORECAST, 84.236),
+]
+
+LORA_ROWS = [
+    ("官方 KSampler ＋ LoRA（第一次載入）", 90.349, NATIVE, None),
+    ("官方 KSampler ＋ LoRA（後續已載入）", 86.164, NATIVE, None),
+    ("MOSS C++ ＋ LoRA（第一次載入，預設）", 23.266, CPP, 90.349),
+    ("MOSS C++ ＋ LoRA（第一次載入，balanced）", 21.017, CPP, 90.349),
+    ("MOSS C++ ＋ LoRA（第一次載入，預設 ＋ 噪聲預測）", 17.358, FORECAST, 90.349),
+    ("MOSS C++ ＋ LoRA（後續已載入，keep_vram ＋ balanced）", 17.281, CPP, 86.164),
+    ("MOSS C++ ＋ LoRA（後續已載入，keep_vram ＋ balanced ＋ 噪聲預測）", 12.118, FORECAST, 86.164),
 ]
 
 
-def main():
-    plt.rcParams["font.family"] = ["Microsoft JhengHei", "sans-serif"]
-    fig, ax = plt.subplots(figsize=(9, 4.2), dpi=150)
-    labels = [row[0] for row in ROWS][::-1]
-    values = [row[1] for row in ROWS][::-1]
-    colors = [row[2] for row in ROWS][::-1]
+def draw_panel(ax, title, rows, xmax):
+    ordered = rows[::-1]
+    labels = [r[0] for r in ordered]
+    values = [r[1] for r in ordered]
+    colors = [r[2] for r in ordered]
     ax.barh(labels, values, color=colors, height=0.62)
-    base = ROWS[0][1]
-    for y, value in enumerate(values):
-        note = "" if value == base else f"  ({base / value:.1f}×)"
-        ax.text(value + 0.25, y, f"{value:.1f} s{note}", va="center", fontsize=9, color=TEXT)
-    ax.set_xlim(0, base * 1.22)
-    ax.set_xlabel("每張圖採樣秒數（越短越快）", color=MUTED, fontsize=9)
-    ax.set_title("MOSS C++ 採樣速度（RTX 5080，1024²，CFG 4）", color=TEXT, fontsize=11, loc="left")
+    for y, (_, value, _, base) in enumerate(ordered):
+        note = "" if base is None else f"  ({base / value:.1f}×)"
+        ax.text(value + 1.0, y, f"{value:.1f} s{note}", va="center", fontsize=8.8, color=TEXT)
+    ax.set_xlim(0, xmax)
+    ax.set_title(title, color=TEXT, fontsize=10.5, loc="left", fontweight="bold", pad=6)
     ax.xaxis.grid(True, color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(GRID)
-    ax.tick_params(axis="y", length=0, labelsize=9, colors=TEXT)
+    ax.tick_params(axis="y", length=0, labelsize=8.8, colors=TEXT)
     ax.tick_params(axis="x", colors=MUTED, labelsize=8)
-    ax.legend(handles=[Patch(color=BASELINE, label="預設設定"),
-                       Patch(color=CHANGES, label="換求解器／少步數（出圖改變）"),
-                       Patch(color=LOSSLESS, label="keep_engine（與 20 步出圖逐位元相同）")],
-              loc="lower right", frameon=False, fontsize=8.5)
-    fig.tight_layout()
+
+
+def main():
+    plt.rcParams["font.family"] = ["Microsoft JhengHei", "sans-serif"]
+    fig, (ax1, ax2) = plt.subplots(
+        2,
+        1,
+        figsize=(10.5, 6.8),
+        dpi=150,
+        gridspec_kw={"height_ratios": [len(NO_LORA_ROWS), len(LORA_ROWS)]},
+    )
+    xmax = 108.0
+    draw_panel(ax1, "無 LoRA（倍率相對官方已載入模型）", NO_LORA_ROWS, xmax)
+    draw_panel(ax2, "掛載 LoRA：第一次載入 vs 後續已載入（倍率相對同條件官方 KSampler）", LORA_ROWS, xmax)
+    ax2.set_xlabel("採樣節點耗時（秒，越短越快；從採樣節點開始計至 VAE Decode 開始）", color=MUTED, fontsize=9)
+
+    fig.suptitle(
+        "官方 KSampler vs MOSS C++ 速度比較（RTX 5080，1024×1024，euler / simple / 50 步 / CFG 3）",
+        color=TEXT,
+        fontsize=11.5,
+        fontweight="bold",
+        x=0.02,
+        ha="left",
+        y=0.975,
+    )
+    handles = [
+        Patch(color=NATIVE, label="官方 KSampler（基準）"),
+        Patch(color=CPP, label="MOSS C++（無噪聲預測）"),
+        Patch(color=FORECAST, label="MOSS C++ ＋ 噪聲預測（forecast_denoise）"),
+    ]
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.015, 0.945), ncol=3, frameon=False, fontsize=8.8)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.895))
     fig.savefig(Path(__file__).with_name("speed.png"), facecolor="white")
 
 

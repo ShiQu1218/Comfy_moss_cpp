@@ -6,12 +6,14 @@
 
 ## 速度
 
-![MOSS C++ 採樣速度比較](docs/speed.png)
+![官方 KSampler 與 MOSS C++ 採樣速度比較](docs/speed.png)
 
-每張圖的採樣時間，從採樣節點開始計到 VAE Decode 開始；keep_engine 的數據取第 2 張起。
+本機 RTX 5080 16 GB 實測，統一設定：**1024×1024、`euler`、`simple`、50 步、CFG 3、batch 1**，兩邊使用同一份 INT8 ConvRot 模型；LoRA 組統一掛載原生 `Load LoRA`（`moss_黑白線稿.safetensors`，`strength_model = 0.7`）。計時為採樣節點耗時（從採樣節點開始計到 VAE Decode 開始）；`keep_vram` 的「後續已載入」數據取第 2 張起。
 
-- **橘色：** 改用 `dpmpp_2m` + `beta`，可把步數降到 20 步；10～12 步時文字與版面仍正確，照片細節略降。出圖會和預設的 ER-SDE 不同。見 [採樣數學研究](MATH_ACCELERATION_RESEARCH.md)。
-- **藍色：** 開啟進階選項 `keep_engine`，連續生圖時省去每張重新載入 DiT 的時間，像素與 20 步逐位元相同。設定方式見下方「參考圖」一節之後的 `keep_engine` 說明，數據見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
+- **灰色（官方 KSampler）：** 無 LoRA 首次 89.0 s／已載入 84.2 s；掛載 LoRA 第一次載入 90.3 s／後續已載入 86.2 s。
+- **藍色（MOSS C++，無噪聲預測）：** 無 LoRA 預設 21.9 s（3.8×）、`keep_vram` + `balanced` 15.7 s（5.4×）；掛載 LoRA 第一次載入 21.0～23.3 s（3.9～4.3×）、後續已載入 17.3 s（5.0×）。`keep_engine` 連續生圖省去重載 DiT，輸出像素逐位元相同，見 [無損加速研究](LOSSLESS_ACCELERATION_RESEARCH.md)。
+- **橘色（MOSS C++ ＋ 噪聲預測 `forecast_denoise`）：** 無 LoRA 預設 16.0 s（5.3×）、常駐 11.0 s（7.6×）；掛載 LoRA 第一次載入 17.4 s（5.2×）、後續已載入 12.1 s（7.1×）。噪聲預測可能微幅改變文字或細節。
+- 若希望進一步減少步數（例如改用 `dpmpp_2m` + `beta` 20 步），可參考 [採樣數學研究](MATH_ACCELERATION_RESEARCH.md)。
 
 重新產生圖表：`python docs/speed_chart.py`。
 
@@ -123,15 +125,45 @@ VRAM 足夠時，可將獨立採樣器的 `memory_mode` 設為 `balanced`，讓�
 
 ## 安裝
 
-1. 將本目錄放在 `ComfyUI/custom_nodes/Comfy_moss_cpp`，重新啟動 ComfyUI。
-2. 從上游下載符合作業系統、顯示卡與驅動的 [MossInfer release](https://github.com/mossimage-cpp/mossimage.cpp/releases/tag/v2.2.1)，核對 `SHA256SUMS` 後，將完整套件解壓到本目錄的 `runtime/`。預期位置為 `runtime/<套件名稱>/bin/moss-infer.exe`（Linux 為 `moss-infer`）。只放一個版本；也可在啟動 ComfyUI 前設定環境變數 `MOSSIMAGE_CPP_EXECUTABLE` 指向可信任的執行檔。不可只複製 exe，還需要套件的 DLL / 函式庫。
-3. 準備官方 MOSS-Image Base 或 SFT 的設定與 tokenizer。以下只下載小檔案，不下載權重；將路徑換成自己的 ComfyUI：
+### 環境與顯卡需求
+
+- **ComfyUI**：v0.22.0 以上（已於 v0.45.4 驗證）；不需要額外安裝 Python 套件（沿用 ComfyUI 內建的 `torch`、`numpy`、`Pillow`）。
+- **顯卡**：僅支援 **NVIDIA CUDA GPU**（AMD／Intel／無 CUDA 環境會自動退回原生 KSampler）。
+
+| 顯卡世代 | 架構 | 適用引擎套件 | 最低驅動版本 |
+| --- | --- | --- | --- |
+| RTX 50 / 40 / 30 系列（含 A100 / L40 等） | Ampere / Ada / Blackwell | 標準套件（CU13 或 CU12） | CU13：≥ 580<br>CU12：Win ≥ 527／Linux ≥ 525 |
+| RTX 20 / GTX 16 系列 | Turing (`sm_75`) | 上游 **`-sm75`** 專用套件 | ≥ 580 |
+| Tesla V100 | Volta (`sm_70`) | Linux CUDA 12 **`-sm70`** 套件 | ≥ 525 |
+
+> `turbo` 模式的 NVFP4 僅限 RTX 50 系列；RTX 30／40 系列請使用 `high`（INT8）或 `reference`（BF16）。
+
+### 方式一：Windows 懶人包（推薦，RTX 30 / 40 / 50 系列、驅動 ≥ 580）
+
+1. 前往本專案的 [Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) 下載 **`Comfy_moss_cpp-v1.0.0-windows-cu13-allinone.zip`**（已內含官方原版 `mossinfer-2.2.1-windows-cu13-x86_64` 與 `moss-lokr-cache.exe`）。
+2. 將 zip 解壓縮到 `ComfyUI/custom_nodes/`，確認資料夾結構為 `ComfyUI/custom_nodes/Comfy_moss_cpp/__init__.py`（不要多包一層目錄）。
+3. 繼續下方「準備模型設定檔與權重」，完成後重新啟動 ComfyUI。
+
+### 方式二：手動安裝（Linux、CUDA 12 舊驅動、RTX 20 系列 `-sm75`）
+
+1. 在 `ComfyUI/custom_nodes/` 內複製本專案（或下載 Release 內的純 node 包 `Comfy_moss_cpp-v1.0.0.zip` 解壓）：
+   ```powershell
+   git clone https://github.com/ShiQu1218/Comfy_moss_cpp.git
+   ```
+2. 前往上游 [MossInfer v2.2.1 Release](https://github.com/mossimage-cpp/mossimage.cpp/releases/tag/v2.2.1)，下載符合你作業系統、顯卡架構與驅動版本的套件（例如 `windows-cu12`、`windows-cu13-sm75`、`linux-cu13` 等），核對 `SHA256SUMS` 後將**完整套件**解壓到本目錄的 `runtime/`。
+   - 預期位置：`Comfy_moss_cpp/runtime/<套件名稱>/bin/moss-infer.exe`（Linux 為 `moss-infer`）。
+   - `runtime/` 內只放一個版本；不可只複製執行檔，必須保留同目錄下的全部 DLL／函式庫。也可在啟動 ComfyUI 前設定環境變數 `MOSSIMAGE_CPP_EXECUTABLE` 指向執行檔。
+3. 繼續下方「準備模型設定檔與權重」，完成後重新啟動 ComfyUI。
+
+### 準備模型設定檔與權重
+
+1. 下載官方 MOSS-Image SFT（或 Base）的設定檔與 tokenizer（只下載小檔，不含大權重；請將路徑換成你的 ComfyUI 目錄）：
 
 ```powershell
 hf download OpenMOSS-Team/MOSS-Image-SFT --revision 2c7954437269461767f533b006823e8f85973a60 --include '*/config.json' --include 'tokenizer/*' --include 'model_index.json' --include 'scheduler/*' --local-dir 'D:/ComfyUI/ComfyUI_windows_portable/ComfyUI/models/mossimage/MOSS-Image-SFT'
 ```
 
-4. 將相容的元件權重放入標準模型目錄：
+2. 將相容的元件權重放入 ComfyUI 標準模型目錄：
 
 | 元件 | 目錄 | 範例 workflow 使用的檔名 |
 | --- | --- | --- |
@@ -139,7 +171,9 @@ hf download OpenMOSS-Team/MOSS-Image-SFT --revision 2c7954437269461767f533b00682
 | 文字編碼器 | `models/text_encoders/` | `qwen3.5_9b_int8_convrot.safetensors` |
 | VAE | `models/vae/` | `flux2-vae_small.safetensors` |
 
-設定目錄與元件須符合相同架構；上游引擎會拒絕不支援的模型。現有 `unet` 等 ComfyUI 設定的模型搜尋路徑也會沿用。不需要額外 Python 套件，使用 ComfyUI 已有的 torch、numpy、Pillow。
+設定目錄與元件須符合相同架構；上游引擎會拒絕不支援的模型。現有 `unet` 等 ComfyUI 設定的模型搜尋路徑也會沿用。
+
+3. 重啟 ComfyUI 後，在既有 MOSS-Image workflow 中將原本的 `KSampler` 換成 **KSampler (MOSS Image C++)**（或直接匯入 [workflows/modular.json](workflows/modular.json)）即可開始使用。
 
 ## 舊整合節點與測試
 
