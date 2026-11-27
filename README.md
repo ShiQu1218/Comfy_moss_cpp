@@ -36,13 +36,13 @@ Regenerate the chart: `python docs/speed_chart.py`.
 
 ### Option 1: Windows All-in-One Package (Recommended for RTX 30 / 40 / 50, Driver ≥ 580)
 
-1. Download **`Comfy_moss_cpp-v1.0.0-windows-cu13-allinone.zip`** from [GitHub Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) (bundles the official `mossinfer-2.2.1-windows-cu13-x86_64` runtime and `moss-lokr-cache.exe`).
+1. Download **`Comfy_moss_cpp-v1.0.1-windows-cu13-allinone.zip`** from [GitHub Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) (bundles the official `mossinfer-2.2.1-windows-cu13-x86_64` runtime and `moss-lokr-cache.exe`).
 2. Extract it into `ComfyUI/custom_nodes/` so the path is `ComfyUI/custom_nodes/Comfy_moss_cpp/__init__.py` (avoid nested duplicate folders).
 3. Follow **Model Configs & Weights** below, then restart ComfyUI.
 
 ### Option 2: Manual Installation (Linux, CUDA 12 Drivers, or RTX 20 `-sm75`)
 
-1. Clone this repository into `ComfyUI/custom_nodes/` (or extract `Comfy_moss_cpp-v1.0.0.zip` from Releases):
+1. Clone this repository into `ComfyUI/custom_nodes/` (or extract `Comfy_moss_cpp-v1.0.1.zip` from Releases):
    ```powershell
    git clone https://github.com/ShiQu1218/Comfy_moss_cpp.git
    ```

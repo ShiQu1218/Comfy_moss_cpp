@@ -29,6 +29,7 @@ MAX_REFERENCE_TOKENS = 16384
 MAX_REFERENCE_SIDE = 1024
 # int(steps / denoise) schedule length; steps=1000 at the UI's smallest denoise step (0.01) fits.
 MAX_SCHEDULE_STEPS = 100000
+ENGINE_CACHE = Path(__file__).resolve().parent / "cache" / "engine"
 CPP_SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "er_sde", "res_multistep"]
 KEEP_ENGINE = ["off", "release_vram", "keep_vram"]
 # (load key, ComponentSession) kept between runs by keep_engine; ComfyUI runs one prompt at a time.
@@ -243,7 +244,9 @@ class MossImageCppSampler(io.ComfyNode):
         sigmas = sampling_sigmas(sampling, scheduler, steps, denoise)
         load = {"model": str(bundle_path(bundle)), "dit_file": path, "tier": tier, "mode": memory_mode,
                 "text_encoder_file": component_metadata_file("text_encoders", "qwen3.5_9b"),
-                "vae_file": component_metadata_file("vae", "flux2")}
+                "vae_file": component_metadata_file("vae", "flux2"),
+                # Keeps the engine's hardware profile and fused-GEMM self-check across processes (~1.8 s per start).
+                "cache_dir": str(ENGINE_CACHE)}
         if cuda_graphs:
             load["block_path"] = "fused_graphs"
         executable = executable_path().with_name("moss-server.exe" if os.name == "nt" else "moss-server")

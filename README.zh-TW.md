@@ -142,13 +142,13 @@ VRAM 足夠時，可將獨立採樣器的 `memory_mode` 設為 `balanced`，讓�
 
 ### 方式一：Windows 懶人包（推薦，RTX 30 / 40 / 50 系列、驅動 ≥ 580）
 
-1. 前往本專案的 [Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) 下載 **`Comfy_moss_cpp-v1.0.0-windows-cu13-allinone.zip`**（已內含官方原版 `mossinfer-2.2.1-windows-cu13-x86_64` 與 `moss-lokr-cache.exe`）。
+1. 前往本專案的 [Releases](https://github.com/ShiQu1218/Comfy_moss_cpp/releases) 下載 **`Comfy_moss_cpp-v1.0.1-windows-cu13-allinone.zip`**（已內含官方原版 `mossinfer-2.2.1-windows-cu13-x86_64` 與 `moss-lokr-cache.exe`）。
 2. 將 zip 解壓縮到 `ComfyUI/custom_nodes/`，確認資料夾結構為 `ComfyUI/custom_nodes/Comfy_moss_cpp/__init__.py`（不要多包一層目錄）。
 3. 繼續下方「準備模型設定檔與權重」，完成後重新啟動 ComfyUI。
 
 ### 方式二：手動安裝（Linux、CUDA 12 舊驅動、RTX 20 系列 `-sm75`）
 
-1. 在 `ComfyUI/custom_nodes/` 內複製本專案（或下載 Release 內的純 node 包 `Comfy_moss_cpp-v1.0.0.zip` 解壓）：
+1. 在 `ComfyUI/custom_nodes/` 內複製本專案（或下載 Release 內的純 node 包 `Comfy_moss_cpp-v1.0.1.zip` 解壓）：
    ```powershell
    git clone https://github.com/ShiQu1218/Comfy_moss_cpp.git
    ```
